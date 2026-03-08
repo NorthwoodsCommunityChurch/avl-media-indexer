@@ -33,5 +33,10 @@ thumbnails/
 # Build artifacts
 *.zip
 
+# Large binary installers
+*.tar
+Blackmagic_RAW_Linux_*.tar
+REDline_Build_*.sh
+
 # Claude plans
 .claude/

@@ -25,7 +25,7 @@ import urllib.error
 # Configuration
 # ---------------------------------------------------------------------------
 
-SEARCH_API = "http://10.10.11.173:8081"
+SEARCH_API = "http://10.10.11.157:8081"
 SERVER_NAME = "vault-media-search"
 SERVER_VERSION = "1.0.0"
 
@@ -141,6 +141,44 @@ TOOLS = [
             "type": "object",
             "properties": {}
         }
+    },
+    {
+        "name": "search_person_media",
+        "description": (
+            "Search for media containing a specific person by name. Uses face recognition "
+            "data to find images and videos where the named person appears. Can combine "
+            "person name with scene descriptions, e.g., 'Jon Smith red shirt outdoor'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Person name, optionally with scene keywords (e.g., 'Jon Smith red shirt')"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Max results to return (default 10, max 50)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "list_known_persons",
+        "description": "List all persons identified in the media vault via face recognition.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "face_recognition_status",
+        "description": "Get face recognition statistics: faces detected, clustered, named, and persons identified.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
@@ -215,6 +253,70 @@ def execute_tool(name, arguments):
         for f in folders:
             lines.append(f"  {f['name']} — {f['path']}")
             lines.append(f"    Files: {f['count']}, Last scan: {f.get('last_scan', 'never')}")
+        return "\n".join(lines)
+
+    elif name == "search_person_media":
+        # Person names are stored in face_names column which is in the FTS index,
+        # so regular search naturally finds them
+        query = arguments.get("query", "")
+        limit = min(int(arguments.get("limit", 10)), 50)
+
+        data = api_get(f"/search?q={urllib.request.quote(query)}&limit={limit}")
+
+        if "error" in data:
+            return f"Error: {data['error']}"
+
+        results = data.get("results", [])
+        if not results:
+            return f"No media found matching: {query}"
+
+        lines = [f"Found {data.get('count', len(results))} results for \"{query}\":\n"]
+        for r in results:
+            lines.append(f"  [{r['type']}] {r['filename']}")
+            if r.get('description'):
+                desc = r['description'][:300]
+                lines.append(f"    {desc}")
+            if r.get('duration'):
+                mins = int(r['duration'] // 60)
+                secs = int(r['duration'] % 60)
+                lines.append(f"    Duration: {mins}:{secs:02d}")
+            lines.append(f"    Path: {r['path']}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    elif name == "list_known_persons":
+        data = api_get("/faces/persons")
+
+        if "error" in data:
+            return f"Error: {data['error']}"
+
+        persons = data.get("persons", [])
+        if not persons:
+            return "No named persons yet. Use the face management UI to name face clusters."
+
+        lines = ["Known Persons:"]
+        for p in persons:
+            lines.append(f"  {p['name']} ({p['face_count']} faces)")
+        return "\n".join(lines)
+
+    elif name == "face_recognition_status":
+        data = api_get("/faces/status")
+
+        if "error" in data:
+            return f"Error: {data['error']}"
+
+        lines = [
+            "Face Recognition Status:",
+            f"  Total faces detected:   {data.get('total_faces', 0)}",
+            f"  Clustered:              {data.get('clustered_faces', 0)}",
+            f"  Named:                  {data.get('named_faces', 0)}",
+            f"  Named persons:          {data.get('named_persons', 0)}",
+            f"  Unnamed clusters:       {data.get('unnamed_clusters', 0)}",
+            f"  Files with faces:       {data.get('files_with_faces', 0)}",
+            f"  Files not yet scanned:  {data.get('files_without_face_scan', 0)}",
+            f"  Face recognition lib:   {'available' if data.get('face_recognition_available') else 'not installed'}"
+        ]
         return "\n".join(lines)
 
     else:

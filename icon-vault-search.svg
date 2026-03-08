@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#08080a"/>
+      <stop offset="100%" stop-color="#0e0e18"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#aaaaaa"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="clip">
+      <rect width="512" height="512" rx="112"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <rect width="512" height="512" fill="url(#bg)"/>
+    <g transform="translate(256,256)">
+      <circle r="168" fill="none" stroke="url(#ring)" stroke-width="5" opacity="0.6"/>
+      <circle r="148" fill="#111114" stroke="#ffffff" stroke-width="2" stroke-opacity="0.25"/>
+      <line x1="0" y1="-96" x2="0" y2="-52" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" opacity="0.8"/>
+      <line x1="0" y1="52" x2="0" y2="96" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" opacity="0.8"/>
+      <line x1="-96" y1="0" x2="-52" y2="0" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" opacity="0.8"/>
+      <line x1="52" y1="0" x2="96" y2="0" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" opacity="0.8"/>
+      <circle r="26" fill="none" stroke="#ffffff" stroke-width="2.5" opacity="0.8"/>
+      <circle r="8" fill="#ffffff" opacity="0.6"/>
+    </g>
+    <g filter="url(#glow)">
+      <line x1="392" y1="392" x2="438" y2="438" stroke="url(#ring)" stroke-width="12" stroke-linecap="round"/>
+      <circle cx="358" cy="358" r="48" fill="none" stroke="url(#ring)" stroke-width="5"/>
+      <circle cx="358" cy="358" r="42" fill="#ffffff" opacity="0.06"/>
+      <line x1="330" y1="358" x2="386" y2="358" stroke="#ffffff" stroke-width="2" opacity="0.5" stroke-dasharray="3 5"/>
+    </g>
+  </g>
+  <rect width="512" height="512" rx="112" fill="none" stroke="#ffffff" stroke-width="1" opacity="0.06"/>
+</svg>

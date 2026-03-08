@@ -1,3 +1,5 @@
+> ⚠️ ARCHIVE — This document describes the macOS/MoltenVK phase of the project and is kept for historical reference only. Do NOT use for current operations. Current docs: `HARDWARE.md`, `SERVERS.md`
+
 # Metal Multi-GPU AMD Project Context
 
 This document contains everything needed to continue working on native Metal multi-GPU support for llama.cpp on the Mac Pro with AMD GPUs. Use this to bootstrap a fresh Claude Code chat.
@@ -11,8 +13,8 @@ Replace Vulkan->MoltenVK->Metal translation chain (~7 tokens/sec with Qwen3-VL-3
 - **Machine**: Mac Pro (Intel Xeon W-3245, 96GB RAM)
 - **GPUs**: 2x AMD Radeon RX 580 (8GB each) + 1x AMD Radeon Pro 580X (8GB) = 24GB VRAM
 - **GPU Architecture**: GCN4 (Polaris), 64-wide wavefronts (SIMD width = 64)
-- **IP**: 10.10.11.173
-- **SSH**: `ssh mediaadmin@10.10.11.173` (then `export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"` for cmake)
+- **IP**: 10.10.11.157
+- **SSH**: `ssh mediaadmin@10.10.11.157` (then `export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"` for cmake)
 
 ## Repository
 
@@ -213,7 +215,7 @@ Note: Commit `6c8e856` disabled simdgroup_reduction; commit `04b0531` re-enabled
 ./build-metal/bin/llama-server -m ~/models/Qwen3VL-32B-Instruct-Q4_K_M.gguf --port 8090 --host 0.0.0.0
 
 # API test
-curl -s http://10.10.11.173:8090/v1/chat/completions -H "Content-Type: application/json" \
+curl -s http://10.10.11.157:8090/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"model":"test","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":10}'
 
 # Debug logging (shows pipeline compilation details including threadExecutionWidth)

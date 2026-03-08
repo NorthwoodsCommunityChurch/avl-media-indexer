@@ -5,14 +5,14 @@ Translates OpenAI function-calling API into plain-text prompts that Gemma
 can understand, then parses Gemma's response back into OpenAI tool_calls format.
 
 Sits between Continue (VS Code) and llama.cpp:
-  Continue → localhost:8083 → 10.10.11.173:8080 (Gemma)
+  Continue → localhost:8083 → 10.10.11.157:8080 (Gemma)
 
 No external dependencies — uses only Python 3 standard library.
 
 Usage:
   python3 tool-proxy.py                    # default ports
   python3 tool-proxy.py --port 8083        # custom local port
-  python3 tool-proxy.py --backend http://10.10.11.173:8080  # custom backend
+  python3 tool-proxy.py --backend http://10.10.11.157:8080  # custom backend
 """
 
 import json
@@ -28,7 +28,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 
 LISTEN_PORT = 8083
-BACKEND_URL = "http://10.10.11.173:8080"
+BACKEND_URL = "http://10.10.11.157:8080"
 DEBUG = True  # Set to False to silence logging
 
 def log(msg):
