@@ -5183,6 +5183,76 @@ loadAll();
                         })
                     self._json({"keyframes": keyframes})
 
+                elif parsed.path == "/transcripts":
+                    # List files that have transcripts, filterable by folder path
+                    # ?folder=Weekend Service  — substring match on file path
+                    # ?limit=50               — max results (default 50, max 500)
+                    folder_filter = params.get("folder", [""])[0]
+                    try:
+                        limit = int(params.get("limit", ["50"])[0])
+                    except ValueError:
+                        limit = 50
+                    limit = max(1, min(limit, 500))
+
+                    if folder_filter:
+                        rows = indexer.db.execute(
+                            "SELECT id, path, filename, duration_seconds, file_type "
+                            "FROM files WHERE transcript IS NOT NULL AND transcript != '' "
+                            "AND path LIKE ? ORDER BY filename LIMIT ?",
+                            ("%%%s%%" % folder_filter, limit)
+                        ).fetchall()
+                    else:
+                        rows = indexer.db.execute(
+                            "SELECT id, path, filename, duration_seconds, file_type "
+                            "FROM files WHERE transcript IS NOT NULL AND transcript != '' "
+                            "ORDER BY filename LIMIT ?",
+                            (limit,)
+                        ).fetchall()
+
+                    results = []
+                    for r in rows:
+                        results.append({
+                            "id": r[0],
+                            "path": r[1],
+                            "filename": r[2],
+                            "duration_seconds": r[3],
+                            "file_type": r[4],
+                        })
+                    self._json({"count": len(results), "files": results})
+
+                elif parsed.path == "/transcript":
+                    # Get full transcript for a file by ID
+                    # ?id=<file_id>
+                    fid = params.get("id", [""])[0]
+                    if not fid:
+                        self._json({"error": "Missing ?id= parameter"}, 400)
+                        return
+
+                    row = indexer.db.execute(
+                        "SELECT id, path, filename, duration_seconds, transcript, transcript_segments "
+                        "FROM files WHERE id = ?", (fid,)
+                    ).fetchone()
+
+                    if not row:
+                        self._json({"error": "File not found"}, 404)
+                        return
+
+                    segments = []
+                    if row[5]:
+                        try:
+                            segments = json.loads(row[5])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    self._json({
+                        "id": row[0],
+                        "path": row[1],
+                        "filename": row[2],
+                        "duration_seconds": row[3],
+                        "transcript": row[4] or "",
+                        "segments": segments,
+                    })
+
                 else:
                     self._json({"error": "Not found"}, 404)
 
@@ -5396,7 +5466,7 @@ loadAll();
 
         server = HTTPServer(("0.0.0.0", serve_port), SearchHandler)
         log.info(f"Search API running on http://0.0.0.0:{serve_port}")
-        log.info(f"Endpoints: /search?q=, /status, /health, /gpu-status, /folders, /faces/ui, /faces/clusters, /faces/persons")
+        log.info(f"Endpoints: /search?q=, /status, /health, /gpu-status, /folders, /transcripts, /transcript, /faces/ui, /faces/clusters, /faces/persons")
 
         # Auto-start face detection if there are unscanned files
         if HAS_FACE_RECOGNITION:
