@@ -10,13 +10,36 @@ All servers run as systemd services under `mediaadmin`. They auto-start on boot.
 |---|---|---|---|
 | `gemma0.service` | llama-server, Gemma 3 12B Q3_K_S, Vulkan1 (RX 580) | 8090 | 127.0.0.1 |
 | `gemma1.service` | llama-server, Gemma 3 12B Q3_K_S, Vulkan2 (RX 580) | 8091 | 127.0.0.1 |
-| `whisper.service` | whisper-server, large-v3-turbo, GPU 0 (Pro 580X) | 8092 | 127.0.0.1 |
-| `media-indexer.service` | media-indexer.py watch mode (4 vaults) | — | — |
+| ~~`whisper.service`~~ | **DISABLED** — managed by Pro 580X Orchestrator now | 8092 | 127.0.0.1 |
+| `media-indexer.service` | media-indexer.py watch mode (4 vaults) + Pro 580X Orchestrator | — | — |
 | `media-search.service` | media-indexer.py serve (search API) | 8081 | 0.0.0.0 |
 | `dashboard-agent.service` | AVL Dashboard Agent (Python) | 49990 | — |
 | `gpu-fans-max.service` | Sets RX 580 fans to max PWM on boot | — | — |
 
-> **Important**: LLM servers (8090/8091/8092) bind to **127.0.0.1 only** — they are reachable only from the Mac Pro itself. The `media-indexer.py` runs on the same machine, so this works fine. The search API (8081) binds to 0.0.0.0 and is reachable from the network.
+> **Important**: LLM servers (8090/8091) bind to **127.0.0.1 only** — they are reachable only from the Mac Pro itself. The Pro 580X ports (8092 Whisper, 8093 Gemma) are also 127.0.0.1 only and managed by the orchestrator. The search API (8081) binds to 0.0.0.0 and is reachable from the network.
+
+## Pro 580X Orchestrator (Model Swapping)
+
+The Pro 580X GPU is shared between Gemma (API visual analysis) and Whisper (transcription). Both models can't fit in 8 GB VRAM simultaneously, so the orchestrator swaps between them.
+
+**Default state**: Gemma loaded on port 8093 (instant API responses).
+
+**When transcription work is pending**: The orchestrator stops Gemma, starts Whisper on port 8092, processes a batch of up to 10 transcriptions, then swaps back to Gemma.
+
+**API interrupts Whisper**: If an API visual_analysis request arrives while Whisper is transcribing, the orchestrator kills whisper-server immediately, re-queues the in-progress task, and loads Gemma. The app sees the swap status via `GET /orchestrator-status`.
+
+**Architecture**:
+- RX 580s (Gemma0/Gemma1): Pure crawler workers — only process `source='crawler'` visual_analysis tasks
+- Pro 580X: Dedicated API GPU — processes `source='api'` visual_analysis tasks + crawler transcription
+- `whisper.service` is **disabled** — the orchestrator manages whisper-server as a subprocess
+
+```bash
+# Check orchestrator status
+curl http://localhost:8081/orchestrator-status
+
+# Disable whisper.service (orchestrator manages it now)
+sudo systemctl disable --now whisper.service
+```
 
 ## Binary Paths
 
@@ -58,11 +81,13 @@ LLM servers respond to `/health` from localhost only:
 ssh mediaadmin@10.10.11.157
 curl http://localhost:8090/health   # Gemma (RX 580 #1)
 curl http://localhost:8091/health   # Gemma (RX 580 #2)
-curl http://localhost:8092/health   # Whisper (Pro 580X)
+curl http://localhost:8093/health   # Gemma on Pro 580X (only when loaded)
+curl http://localhost:8092/health   # Whisper on Pro 580X (only when loaded)
 
 # Search API is reachable from the network:
 curl http://10.10.11.157:8081/health
 curl http://10.10.11.157:8081/status
+curl http://10.10.11.157:8081/orchestrator-status   # Pro 580X state
 ```
 
 ## LLM Server Startup Commands
@@ -131,8 +156,8 @@ ssh llm-server "mount | grep vault"
 ## Reboot Procedure
 
 ```bash
-# Stop services gracefully
-ssh llm-server "sudo systemctl stop media-indexer media-search gemma0 gemma1 whisper"
+# Stop services gracefully (whisper.service is disabled — orchestrator manages it)
+ssh llm-server "sudo systemctl stop media-indexer media-search gemma0 gemma1"
 
 # Reboot
 ssh llm-server "sudo reboot"

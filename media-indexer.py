@@ -23,6 +23,9 @@ import queue
 import signal
 import logging
 import itertools
+import uuid
+import cgi
+import io
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -78,11 +81,21 @@ LLM_SERVERS = [
 LLM_FALLBACK = "http://localhost:8080"  # Single-server mode fallback
 WHISPER_SERVER = "http://localhost:8092"  # GPU0 (Pro 580X) — Whisper
 TRANSCRIPTION_MAX_SECONDS = 600  # Cap at 10 minutes per file
+
+# Pro 580X orchestrator — model-swapping between Gemma (API) and Whisper (transcription)
+PRO580X_GEMMA_PORT = 8093
+PRO580X_GEMMA = "http://localhost:%d" % PRO580X_GEMMA_PORT
+PRO580X_WHISPER_PORT = 8092  # same as WHISPER_SERVER
+MODEL_LOAD_TIMEOUT = 60          # seconds to wait for /health after starting a server
+WHISPER_BATCH_MAX_TASKS = 10     # max transcriptions before forcing swap back to Gemma
+
 DATA_DIR = Path.home() / "media-index"
 DB_PATH = DATA_DIR / "index.db"
 TRANSCRIBE_HEARTBEAT = DATA_DIR / "transcribe-active"  # touched while transcribing
 SCANNER_STATE_FILE   = DATA_DIR / "scanner-state.json" # written by watch process, read by serve
+PRO580X_STATE_FILE   = DATA_DIR / "pro580x-state.json" # written by watch, read by serve
 THUMB_DIR = DATA_DIR / "thumbnails"
+UPLOAD_DIR = DATA_DIR / "uploads"
 CHROMA_DIR = DATA_DIR / "chroma"
 LOG_PATH = DATA_DIR / "indexer.log"
 FFMPEG = "/usr/bin/ffmpeg"
@@ -172,6 +185,7 @@ def init_db():
     """Create database and tables if they don't exist."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     db = sqlite3.connect(str(DB_PATH), timeout=30)
     db.execute("PRAGMA journal_mode=WAL")
@@ -320,6 +334,67 @@ def init_db():
         db.commit()
         log.info("Migrated: added transcript_segments column to files table")
 
+    # Migration: add source column to tasks (api vs crawler priority)
+    try:
+        db.execute("SELECT source FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        db.execute("ALTER TABLE tasks ADD COLUMN source TEXT DEFAULT 'crawler'")
+        db.commit()
+        log.info("Migrated: added source column to tasks table")
+
+    # Migration: add api_job_id column to tasks (links task to API job)
+    try:
+        db.execute("SELECT api_job_id FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        db.execute("ALTER TABLE tasks ADD COLUMN api_job_id TEXT")
+        db.commit()
+        log.info("Migrated: added api_job_id column to tasks table")
+
+    # API jobs table — tracks externally submitted jobs
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS api_jobs (
+            id TEXT PRIMARY KEY,
+            task_type TEXT NOT NULL,
+            status TEXT DEFAULT 'queued',
+            source_app TEXT,
+            uploaded_filename TEXT,
+            upload_path TEXT,
+            result TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_api_jobs_status ON api_jobs(status)")
+    db.commit()
+
+    # Migration: add lyrics column to api_jobs
+    try:
+        db.execute("SELECT lyrics FROM api_jobs LIMIT 1")
+    except Exception:
+        db.execute("ALTER TABLE api_jobs ADD COLUMN lyrics TEXT")
+        db.commit()
+        log.info("Migrated: added lyrics column to api_jobs table")
+
+    # Migration: add text_chat columns to api_jobs
+    try:
+        db.execute("SELECT prompt FROM api_jobs LIMIT 1")
+    except Exception:
+        db.execute("ALTER TABLE api_jobs ADD COLUMN prompt TEXT")
+        db.execute("ALTER TABLE api_jobs ADD COLUMN max_tokens INTEGER")
+        db.execute("ALTER TABLE api_jobs ADD COLUMN temperature REAL")
+        db.commit()
+        log.info("Migrated: added prompt/max_tokens/temperature columns to api_jobs table")
+
+    # Migration: add match_threshold column to persons table (adaptive matching)
+    try:
+        db.execute("SELECT match_threshold FROM persons LIMIT 1")
+    except Exception:
+        db.execute("ALTER TABLE persons ADD COLUMN match_threshold REAL")
+        db.commit()
+        log.info("Migrated: added match_threshold column to persons table")
+
     # Issue #28: notifications table
     db.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
@@ -413,6 +488,88 @@ def init_db():
 
     db.commit()
     return db
+
+
+def _update_api_job(db, task_id, status, result=None, error=None):
+    """If this task belongs to an API job, update the job's status and result."""
+    row = db.execute(
+        "SELECT t.api_job_id, t.task_type, t.file_id FROM tasks t "
+        "WHERE t.id=? AND t.api_job_id IS NOT NULL",
+        (task_id,)
+    ).fetchone()
+    if not row:
+        return
+    job_id, task_type, file_id = row
+    now = datetime.now().isoformat()
+    if status == 'complete':
+        # Build result from what the worker wrote to the files/keyframes tables
+        if result is None:
+            result = _build_api_result(db, task_type, task_id, file_id)
+        db.execute(
+            "UPDATE api_jobs SET status='complete', completed_at=?, result=? WHERE id=?",
+            (now, json.dumps(result) if result else None, job_id)
+        )
+    elif status == 'failed':
+        db.execute(
+            "UPDATE api_jobs SET status='failed', completed_at=?, error_message=? WHERE id=?",
+            (now, error, job_id)
+        )
+    elif status == 'assigned':
+        db.execute(
+            "UPDATE api_jobs SET status='processing', started_at=? WHERE id=? AND status='queued'",
+            (now, job_id)
+        )
+    db.commit()
+
+
+def _build_api_result(db, task_type, task_id, file_id):
+    """Extract the result payload from DB after a task completes."""
+    if task_type == 'transcribe':
+        row = db.execute(
+            "SELECT transcript, transcript_segments FROM files WHERE id=?", (file_id,)
+        ).fetchone()
+        if row:
+            segments = json.loads(row[1]) if row[1] else []
+            return {"transcript": row[0] or "", "segments": segments}
+    elif task_type == 'visual_analysis':
+        # task_id format: "{keyframe_id}_visual_analysis"
+        kf_id = task_id[:-len("_visual_analysis")]
+        row = db.execute(
+            "SELECT ai_description FROM keyframes WHERE id=?", (kf_id,)
+        ).fetchone()
+        if row:
+            return {"description": row[0] or ""}
+    elif task_type == 'face_detect':
+        kf_id = task_id[:-len("_face_detect")]
+        faces = db.execute(
+            "SELECT id, person_id, cluster_id FROM faces WHERE keyframe_id=?", (kf_id,)
+        ).fetchall()
+        return {"faces_found": len(faces), "face_ids": [f[0] for f in faces]}
+    elif task_type == 'scene_detect':
+        kf_count = db.execute(
+            "SELECT COUNT(*) FROM keyframes WHERE file_id=?", (file_id,)
+        ).fetchone()[0]
+        return {"keyframe_count": kf_count}
+    elif task_type == 'ala':
+        # ALA result is stored directly by ALAWorker — read from api_jobs.result
+        row = db.execute(
+            "SELECT result FROM api_jobs WHERE id=(SELECT api_job_id FROM tasks WHERE id=?)",
+            (task_id,)
+        ).fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+    elif task_type == 'text_chat':
+        # text_chat result is stored directly in api_jobs.result
+        row = db.execute(
+            "SELECT result FROM api_jobs WHERE id=(SELECT api_job_id FROM tasks WHERE id=?)",
+            (task_id,)
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return {"response": row[0]}
+    return {}
 
 
 def file_id(path, size, mtime):
@@ -1008,6 +1165,83 @@ def describe_image(image_path, context="", llm_server=None, image_b64=None, imag
     except Exception as e:
         log.error("Vision description failed for %s (server: %s): %s" % (image_path, llm_server, e))
         return None
+
+
+def send_text_prompt(prompt, llm_server=None, max_tokens=200, temperature=0.3):
+    """Send a text-only prompt to Gemma and return the response text.
+    Used by the text_chat API task type for classification, summarization, etc."""
+    if llm_server is None:
+        llm_server = PRO580X_GEMMA
+    try:
+        req_data = json.dumps({
+            "model": "gemma-3-12b",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": int(max_tokens) if max_tokens else 200,
+            "temperature": float(temperature) if temperature else 0.3,
+        }).encode()
+        req = urllib.request.Request(
+            "%s/v1/chat/completions" % llm_server,
+            data=req_data,
+            headers={"Content-Type": "application/json"}
+        )
+        resp = urllib.request.urlopen(req, timeout=120)
+        result = json.loads(resp.read())
+        return result["choices"][0]["message"]["content"].strip()
+    except urllib.error.URLError as e:
+        log.error("LLM server not reachable (%s): %s" % (llm_server, e))
+        return None
+    except Exception as e:
+        log.error("Text prompt failed (server: %s): %s" % (llm_server, e))
+        return None
+
+
+def verify_face_match(reference_path, candidate_path, llm_server=None):
+    """Ask Gemma if two face thumbnails show the same person.
+    Sends both images to Gemma's vision API.
+    Returns True if Gemma confirms match, False if not or on error."""
+    if llm_server is None:
+        llm_server = PRO580X_GEMMA
+    try:
+        # Load and encode both images
+        images = []
+        for path in (reference_path, candidate_path):
+            if not path or not os.path.exists(path):
+                return False
+            with open(path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode()
+            images.append(img_b64)
+
+        req_data = json.dumps({
+            "model": "gemma-3-12b",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,%s" % images[0]}},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,%s" % images[1]}},
+                    {"type": "text", "text":
+                        "Image 1 is a reference photo of a person. Image 2 is a candidate photo. "
+                        "Are these the SAME person? Consider face shape, features, and overall appearance. "
+                        "Ignore differences in lighting, angle, expression, and image quality. "
+                        "Reply with ONLY the word YES or NO."}
+                ]
+            }],
+            "max_tokens": 5,
+            "temperature": 0.1,
+        }).encode()
+
+        req = urllib.request.Request(
+            "%s/v1/chat/completions" % llm_server,
+            data=req_data,
+            headers={"Content-Type": "application/json"}
+        )
+        resp = urllib.request.urlopen(req, timeout=60)
+        result = json.loads(resp.read())
+        answer = result["choices"][0]["message"]["content"].strip().upper()
+        return "YES" in answer
+
+    except Exception as e:
+        log.warning("verify_face_match failed: %s" % e)
+        return False  # On error, don't assign (conservative)
 
 
 def describe_audio_filename(filepath, context="", llm_server=None):
@@ -1624,14 +1858,19 @@ class PerpetualWhisperWorker:
     Claims 'transcribe' tasks from the tasks table, processes them,
     and marks them complete. Loops forever.
 
+    When an orchestrator is provided, requests Whisper model swap before
+    processing and releases after each task (supports batching and API
+    interruption).
+
     Prefetch: while transcribing file N, audio for file N+1 is extracted
     in a background thread so the GPU has no idle gap between jobs."""
 
     WORKER_ID = "whisper-%d" % os.getpid()
 
-    def __init__(self, db_path, indexer_running):
+    def __init__(self, db_path, indexer_running, orchestrator=None):
         self.db_path = db_path
         self.indexer_running = indexer_running
+        self.orchestrator = orchestrator
         self._thread = None
         self.processed = 0
         self.errors = 0
@@ -1659,7 +1898,7 @@ class PerpetualWhisperWorker:
                 JOIN files f ON t.file_id = f.id
                 WHERE t.task_type = 'transcribe'
                   AND t.status = 'pending'
-                ORDER BY t.created_at ASC
+                ORDER BY (CASE WHEN t.source = 'api' THEN 0 ELSE 1 END), t.created_at ASC
                 LIMIT 1
             """).fetchone()
             if row is None:
@@ -1671,6 +1910,7 @@ class PerpetualWhisperWorker:
             """, (self.WORKER_ID, now, task_id)).rowcount
             if updated == 0:
                 return None  # Race: another worker claimed it first
+            _update_api_job(db, task_id, 'assigned')
         return task_id, file_id, file_path
 
     def _start_prefetch(self, skip_file_id):
@@ -1683,7 +1923,7 @@ class PerpetualWhisperWorker:
                 JOIN files f ON t.file_id = f.id
                 WHERE t.task_type = 'transcribe' AND t.status = 'pending'
                   AND t.file_id != ?
-                ORDER BY t.created_at ASC LIMIT 1
+                ORDER BY (CASE WHEN t.source = 'api' THEN 0 ELSE 1 END), t.created_at ASC LIMIT 1
             """, (skip_file_id,)).fetchone()
             db.close()
         except Exception:
@@ -1817,6 +2057,7 @@ class PerpetualWhisperWorker:
                 WHERE id=?
             """, (status, datetime.now().isoformat(), error, task_id))
             db.commit()
+            _update_api_job(db, task_id, status, error=error)
 
     def run(self):
         db = self._get_db()
@@ -1835,13 +2076,42 @@ class PerpetualWhisperWorker:
                 idle_logged = False
                 task_id, file_id, file_path = task
 
+                # Request Whisper model from orchestrator (swaps from Gemma if needed)
+                if self.orchestrator:
+                    if not self.orchestrator.request_whisper():
+                        # API pending — release task back to pending and wait
+                        log.info("PerpetualWhisperWorker: orchestrator refused Whisper (API pending) — releasing task")
+                        with _db_write_lock:
+                            db.execute("UPDATE tasks SET status='pending', worker_id=NULL WHERE id=?", (task_id,))
+                            db.commit()
+                        time.sleep(2)
+                        continue
+
                 # Kick off prefetch for the next job while we process this one
                 threading.Thread(
                     target=self._start_prefetch, args=(file_id,),
                     daemon=True, name="whisper-prefetch-trigger"
                 ).start()
 
-                self._process(db, task_id, file_id, file_path)
+                try:
+                    self._process(db, task_id, file_id, file_path)
+                except (ConnectionError, urllib.error.URLError, OSError) as e:
+                    # Whisper server was killed (API interrupt) — re-queue the task
+                    log.info("PerpetualWhisperWorker: Whisper interrupted (API preempt) — re-queuing %s" % task_id)
+                    with _db_write_lock:
+                        db.execute("UPDATE tasks SET status='pending', worker_id=NULL, "
+                                   "started_at=NULL WHERE id=?", (task_id,))
+                        db.commit()
+                    time.sleep(1)
+                    continue
+
+                # Tell orchestrator we finished one task — it decides whether to continue batch
+                if self.orchestrator:
+                    if not self.orchestrator.release_whisper():
+                        log.info("PerpetualWhisperWorker: orchestrator swapping back to Gemma")
+                        # Wait a moment for Gemma to load before claiming next task
+                        time.sleep(2)
+
             except Exception as e:
                 log.warning("PerpetualWhisperWorker: transient error, retrying in 5s: %s" % e)
                 time.sleep(5)
@@ -1886,6 +2156,7 @@ class TaskCoordinator:
             try:
                 self._finalize_complete_files(db)
                 self._reset_stuck_tasks(db)
+                self._cleanup_old_uploads(db)
             except Exception as e:
                 log.error("TaskCoordinator: error: %s" % e)
             time.sleep(5)
@@ -1947,6 +2218,33 @@ class TaskCoordinator:
                 """, (cutoff,))
                 db.commit()
 
+    def _cleanup_old_uploads(self, db):
+        """Delete uploaded files and their DB records for completed/failed API jobs older than 24h."""
+        cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+        old_jobs = db.execute("""
+            SELECT id, upload_path FROM api_jobs
+            WHERE status IN ('complete', 'failed') AND completed_at < ?
+              AND upload_path IS NOT NULL
+        """, (cutoff,)).fetchall()
+        if not old_jobs:
+            return
+        for job_id, upload_path in old_jobs:
+            # Delete uploaded file
+            if upload_path:
+                try:
+                    os.unlink(upload_path)
+                except OSError:
+                    pass
+            # Delete the virtual file record and its tasks
+            with _db_write_lock:
+                db.execute("DELETE FROM tasks WHERE api_job_id=?", (job_id,))
+                # Find and delete the files record by path
+                db.execute("DELETE FROM files WHERE path=?", (upload_path,))
+                # Clear the upload_path to mark as cleaned
+                db.execute("UPDATE api_jobs SET upload_path=NULL WHERE id=?", (job_id,))
+                db.commit()
+        log.info("TaskCoordinator: cleaned up %d old API job uploads" % len(old_jobs))
+
     def start(self):
         self._thread = threading.Thread(target=self.run, name="task-coordinator", daemon=True)
         self._thread.start()
@@ -2006,7 +2304,7 @@ class SceneWorker:
                 JOIN files f ON t.file_id = f.id
                 WHERE t.task_type = 'scene_detect'
                   AND t.status = 'pending'
-                ORDER BY t.created_at ASC
+                ORDER BY (CASE WHEN t.source = 'api' THEN 0 ELSE 1 END), t.created_at ASC
                 LIMIT 1
             """).fetchone()
             if row is None:
@@ -2018,6 +2316,7 @@ class SceneWorker:
             """, (self.worker_id, now, task_id)).rowcount
             if updated == 0:
                 return None  # Race: another worker claimed it first
+            _update_api_job(db, task_id, 'assigned')
         return task_id, file_id, file_path, duration
 
     def _run_ffmpeg_watchdog(self, cmd):
@@ -2366,6 +2665,7 @@ class SceneWorker:
                 WHERE id=?
             """, (status, datetime.now().isoformat(), error, task_id))
             db.commit()
+            _update_api_job(db, task_id, status, error=error)
 
     def run(self):
         db = self._get_db()
@@ -2416,11 +2716,13 @@ class SceneWorker:
 class GemmaWorker:
     """Perpetual visual-analysis worker for the Perpetual Task Pipeline.
 
-    Claims 'visual_analysis' tasks, calls describe_image() against one Gemma
-    3 12B server, writes ai_description to the keyframe (or file for image
-    files), and assembles the file-level description once all keyframes are done.
+    Claims crawler-only 'visual_analysis' tasks, calls describe_image() against
+    one Gemma 3 12B server, writes ai_description to the keyframe (or file for
+    image files), and assembles the file-level description once all keyframes
+    are done.
 
     Two instances run in parallel — one per RX 580 / LLM server port.
+    API visual_analysis tasks are handled by Pro580XGemmaWorker instead.
     """
 
     def __init__(self, db_path, llm_server, running_fn):
@@ -2440,7 +2742,8 @@ class GemmaWorker:
         return db
 
     def _claim_task(self, db):
-        """Atomically claim the next pending visual_analysis task.
+        """Atomically claim the next pending crawler visual_analysis task.
+        API tasks are handled by Pro580XGemmaWorker.
         Returns (task_id, file_id) or None."""
         now = datetime.now().isoformat()
         with _db_write_lock:
@@ -2449,6 +2752,7 @@ class GemmaWorker:
                 FROM tasks t
                 WHERE t.task_type = 'visual_analysis'
                   AND t.status = 'pending'
+                  AND t.source = 'crawler'
                 ORDER BY t.created_at ASC
                 LIMIT 1
             """).fetchone()
@@ -2570,6 +2874,611 @@ class GemmaWorker:
 
 
 # ---------------------------------------------------------------------------
+# Pro 580X Orchestrator — model-swapping between Gemma and Whisper
+# ---------------------------------------------------------------------------
+
+class Pro580XOrchestrator:
+    """Manages the Pro 580X GPU by swapping between Gemma (for API visual
+    analysis) and Whisper (for transcription).  Only one model can be loaded
+    at a time due to 8 GB VRAM limit.
+
+    Default state: Gemma loaded (instant API responses).
+    When transcription work is pending, swaps to Whisper, processes a batch,
+    then swaps back to Gemma.  An incoming API request can interrupt Whisper
+    immediately — the in-progress task is re-queued.
+
+    Thread-safe: accessed by PerpetualWhisperWorker, Pro580XGemmaWorker, and
+    the HTTP handler (via state file IPC for the serve process).
+    """
+
+    # Paths to server binaries
+    LLAMA_SERVER  = "/home/mediaadmin/llama.cpp/build/bin/llama-server"
+    WHISPER_SERVER_BIN = "/home/mediaadmin/whisper.cpp/build/bin/whisper-server"
+    MODEL_DIR     = "/home/mediaadmin/models"
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.state = "idle"             # idle | gemma_loading | gemma_ready | whisper_loading | whisper_busy
+        self._current_model = None      # "gemma" | "whisper" | None
+        self._process = None            # subprocess.Popen handle
+        self._condition = threading.Condition()
+        self._api_pending = False       # True when an API call is waiting for Gemma
+        self._batch_count = 0           # transcriptions processed in current Whisper batch
+        self._model_loaded_at = None    # ISO timestamp
+        self._vulkan_device = "0"       # discovered at start()
+        self._shutdown = False
+
+    # -- Public API ----------------------------------------------------------
+
+    def start(self):
+        """Discover Vulkan device, clean up orphans, load Gemma."""
+        self._discover_vulkan_device()
+        self._cleanup_orphans()
+        with self._condition:
+            self._swap_to_gemma()
+        log.info("Pro580XOrchestrator: started (Gemma loaded, Vulkan device %s)" % self._vulkan_device)
+
+    def request_gemma(self, timeout=120):
+        """Called by Pro580XGemmaWorker / API handler.
+        Returns the Gemma server URL when ready, or None on timeout."""
+        with self._condition:
+            if self.state == "gemma_ready":
+                return PRO580X_GEMMA
+
+            # Whisper is running — signal interrupt
+            self._api_pending = True
+            if self.state == "whisper_busy" and self._process:
+                log.info("Pro580XOrchestrator: API request — interrupting Whisper")
+                self._stop_process()
+                # The WhisperWorker will catch the connection error and re-queue
+
+            # Wait for Gemma to become ready
+            deadline = time.time() + timeout
+            while self.state != "gemma_ready" and not self._shutdown:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    log.warning("Pro580XOrchestrator: request_gemma timed out after %ds" % timeout)
+                    return None
+                self._condition.wait(timeout=remaining)
+
+            if self._shutdown:
+                return None
+            self._api_pending = False
+            return PRO580X_GEMMA
+
+    def request_whisper(self):
+        """Called by PerpetualWhisperWorker before transcribing.
+        Returns True if Whisper is ready, False if refused (API pending)."""
+        with self._condition:
+            if self._api_pending or self._shutdown:
+                return False
+            if self.state == "whisper_busy":
+                return True  # already in Whisper mode (batching)
+
+            # Swap from Gemma to Whisper
+            if self.state == "gemma_ready":
+                log.info("Pro580XOrchestrator: swapping to Whisper for transcription")
+                self._stop_process()
+
+            if self._api_pending:
+                # API arrived during Gemma shutdown — abort swap
+                self._swap_to_gemma()
+                return False
+
+            self.state = "whisper_loading"
+            self._write_state()
+            self._condition.notify_all()
+
+            ok = self._start_whisper_server()
+            if not ok:
+                log.error("Pro580XOrchestrator: Whisper failed to start — swapping back to Gemma")
+                self._swap_to_gemma()
+                return False
+
+            self.state = "whisper_busy"
+            self._current_model = "whisper"
+            self._model_loaded_at = datetime.now().isoformat()
+            self._batch_count = 0
+            self._write_state()
+            self._condition.notify_all()
+            return True
+
+    def release_whisper(self):
+        """Called after each transcription completes.
+        Returns True to keep transcribing, False to stop (swap back to Gemma)."""
+        with self._condition:
+            if self.state != "whisper_busy":
+                return False  # Not in Whisper mode — nothing to release
+            self._batch_count += 1
+            should_swap_back = (
+                self._api_pending
+                or self._batch_count >= WHISPER_BATCH_MAX_TASKS
+                or self._shutdown
+                or not self._has_pending_transcriptions()
+            )
+            if should_swap_back:
+                log.info("Pro580XOrchestrator: Whisper batch done (%d tasks) — swapping to Gemma"
+                         % self._batch_count)
+                self._stop_process()
+                self._swap_to_gemma()
+                return False
+            self._write_state()
+            return True
+
+    def get_status(self):
+        """Return status dict and write state file for IPC."""
+        with self._condition:
+            status = {
+                "state": self.state,
+                "current_model": self._current_model,
+                "model_loaded_at": self._model_loaded_at,
+                "api_pending": self._api_pending,
+                "whisper_batch_count": self._batch_count,
+                "pending_transcribe": self._count_pending("transcribe"),
+                "pending_api_visual": self._count_pending_api_visual(),
+            }
+            self._write_state(status)
+            return status
+
+    def shutdown(self):
+        """Kill whichever process is running."""
+        with self._condition:
+            self._shutdown = True
+            self._stop_process()
+            self.state = "idle"
+            self._current_model = None
+            self._condition.notify_all()
+        log.info("Pro580XOrchestrator: shutdown complete")
+
+    # -- Private helpers -----------------------------------------------------
+
+    def _swap_to_gemma(self):
+        """Load Gemma on the Pro 580X.  Must be called with self._condition held."""
+        self.state = "gemma_loading"
+        self._write_state()
+        self._condition.notify_all()
+
+        ok = self._start_gemma_server()
+        if ok:
+            self.state = "gemma_ready"
+            self._current_model = "gemma"
+            self._model_loaded_at = datetime.now().isoformat()
+            self._api_pending = False
+            self._batch_count = 0
+        else:
+            log.error("Pro580XOrchestrator: Gemma failed to start — entering idle state")
+            self.state = "idle"
+            self._current_model = None
+            # Insert a notification so the VaultSearch app knows
+            self._insert_notification("Pro 580X: Gemma failed to start", "error")
+
+        self._write_state()
+        self._condition.notify_all()
+
+    def _start_gemma_server(self):
+        """Start llama-server for Gemma on the Pro 580X.  Returns True on success."""
+        env = os.environ.copy()
+        env["GGML_VK_VISIBLE_DEVICES"] = self._vulkan_device
+        cmd = [
+            self.LLAMA_SERVER,
+            "--host", "127.0.0.1",
+            "--port", str(PRO580X_GEMMA_PORT),
+            "-m", os.path.join(self.MODEL_DIR, "gemma-3-12b-it-Q3_K_S.gguf"),
+            "--mmproj", os.path.join(self.MODEL_DIR, "mmproj-gemma-3-12b-it-f16.gguf"),
+            "--device", "Vulkan0",
+            "-ngl", "99",
+            "-c", "1024",
+            "--parallel", "1",
+        ]
+        try:
+            self._process = subprocess.Popen(
+                cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log.info("Pro580XOrchestrator: starting Gemma (pid %d, port %d)"
+                     % (self._process.pid, PRO580X_GEMMA_PORT))
+        except Exception as e:
+            log.error("Pro580XOrchestrator: failed to spawn llama-server: %s" % e)
+            return False
+        return self._poll_health(PRO580X_GEMMA_PORT)
+
+    def _start_whisper_server(self):
+        """Start whisper-server on the Pro 580X.  Returns True on success."""
+        cmd = [
+            self.WHISPER_SERVER_BIN,
+            "--host", "127.0.0.1",
+            "--port", str(PRO580X_WHISPER_PORT),
+            "-m", os.path.join(self.MODEL_DIR, "ggml-large-v3-turbo.bin"),
+            "--device", "0",
+        ]
+        try:
+            self._process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log.info("Pro580XOrchestrator: starting Whisper (pid %d, port %d)"
+                     % (self._process.pid, PRO580X_WHISPER_PORT))
+        except Exception as e:
+            log.error("Pro580XOrchestrator: failed to spawn whisper-server: %s" % e)
+            return False
+        return self._poll_health(PRO580X_WHISPER_PORT)
+
+    def _stop_process(self):
+        """Stop the currently running server process.  Safe to call if nothing is running."""
+        if self._process is None:
+            return
+        pid = self._process.pid
+        try:
+            self._process.terminate()  # SIGTERM
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log.warning("Pro580XOrchestrator: SIGTERM timeout — sending SIGKILL (pid %d)" % pid)
+                self._process.kill()
+                self._process.wait(timeout=5)
+        except Exception as e:
+            log.error("Pro580XOrchestrator: error stopping process %d: %s" % (pid, e))
+        self._process = None
+
+    def _poll_health(self, port, timeout=None):
+        """Poll /health until status=ok or timeout.  Returns True on success."""
+        if timeout is None:
+            timeout = MODEL_LOAD_TIMEOUT
+        url = "http://localhost:%d/health" % port
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._shutdown:
+                return False
+            try:
+                req = urllib.request.Request(url)
+                resp = urllib.request.urlopen(req, timeout=5)
+                data = json.loads(resp.read())
+                if data.get("status") == "ok":
+                    log.info("Pro580XOrchestrator: health ok on port %d" % port)
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        log.error("Pro580XOrchestrator: health check timed out on port %d after %ds" % (port, timeout))
+        # Kill the process that failed to start
+        self._stop_process()
+        return False
+
+    def _discover_vulkan_device(self):
+        """Determine which Vulkan device index the Pro 580X maps to.
+        The RX 580s use GGML_VK_VISIBLE_DEVICES 1 and 2, so Pro 580X is
+        most likely 0, but we verify via llama-server --list-devices."""
+        try:
+            result = subprocess.run(
+                [self.LLAMA_SERVER, "--list-devices"],
+                capture_output=True, text=True, timeout=10)
+            output = result.stdout + result.stderr
+            # Look for the Pro 580X — it's PCIe 07:00.0 / card0
+            # Default to "0" if we can't parse
+            for line in output.splitlines():
+                lower = line.lower()
+                if "pro 580" in lower or "polaris" in lower:
+                    # Try to extract the device index from e.g. "Vulkan0: ..."
+                    for part in line.split():
+                        if part.startswith("Vulkan"):
+                            idx = part.replace("Vulkan", "").rstrip(":")
+                            if idx.isdigit():
+                                self._vulkan_device = idx
+                                log.info("Pro580XOrchestrator: discovered Pro 580X as Vulkan%s" % idx)
+                                return
+            log.info("Pro580XOrchestrator: could not identify Pro 580X in device list, defaulting to Vulkan0")
+            self._vulkan_device = "0"
+        except Exception as e:
+            log.warning("Pro580XOrchestrator: --list-devices failed (%s), defaulting to Vulkan0" % e)
+            self._vulkan_device = "0"
+
+    def _cleanup_orphans(self):
+        """Kill any stale llama-server or whisper-server on our ports from a previous crash."""
+        import socket
+        for port in (PRO580X_GEMMA_PORT, PRO580X_WHISPER_PORT):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", port))
+                sock.close()
+                # Port is in use — find and kill the process
+                log.warning("Pro580XOrchestrator: port %d in use — killing orphan process" % port)
+                try:
+                    result = subprocess.run(
+                        ["fuser", "-k", "%d/tcp" % port],
+                        capture_output=True, timeout=5)
+                except Exception:
+                    pass
+                time.sleep(1)
+            except (ConnectionRefusedError, OSError):
+                pass  # Port is free
+            finally:
+                sock.close()
+
+    def _write_state(self, status=None):
+        """Write orchestrator state to JSON file for IPC with the serve process."""
+        if status is None:
+            status = {
+                "state": self.state,
+                "current_model": self._current_model,
+                "model_loaded_at": self._model_loaded_at,
+                "api_pending": self._api_pending,
+                "whisper_batch_count": self._batch_count,
+            }
+        try:
+            tmp = str(PRO580X_STATE_FILE) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(status, f)
+            os.replace(tmp, str(PRO580X_STATE_FILE))
+        except Exception as e:
+            log.warning("Pro580XOrchestrator: failed to write state file: %s" % e)
+
+    def _has_pending_transcriptions(self):
+        """Check if there are pending transcribe tasks in the DB."""
+        try:
+            db = sqlite3.connect(str(self.db_path), timeout=5)
+            row = db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE task_type='transcribe' AND status='pending'"
+            ).fetchone()
+            db.close()
+            return row[0] > 0
+        except Exception:
+            return False
+
+    def _count_pending(self, task_type):
+        """Count pending tasks of a given type."""
+        try:
+            db = sqlite3.connect(str(self.db_path), timeout=5)
+            row = db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE task_type=? AND status='pending'",
+                (task_type,)
+            ).fetchone()
+            db.close()
+            return row[0]
+        except Exception:
+            return 0
+
+    def _count_pending_api_visual(self):
+        """Count pending API visual_analysis tasks."""
+        try:
+            db = sqlite3.connect(str(self.db_path), timeout=5)
+            row = db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE task_type='visual_analysis' "
+                "AND status='pending' AND source='api'"
+            ).fetchone()
+            db.close()
+            return row[0]
+        except Exception:
+            return 0
+
+    def _insert_notification(self, title, severity="warning"):
+        """Insert a notification into the DB for the VaultSearch app."""
+        try:
+            db = sqlite3.connect(str(self.db_path), timeout=5)
+            db.execute(
+                "INSERT INTO notifications (id, severity, title, created_at) VALUES (?, ?, ?, ?)",
+                (str(uuid.uuid4()), severity, title, datetime.now().isoformat())
+            )
+            db.commit()
+            db.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Pro580XGemmaWorker — API-only visual analysis on the Pro 580X
+# ---------------------------------------------------------------------------
+
+class Pro580XGemmaWorker:
+    """Dedicated worker that processes API visual_analysis tasks on the Pro 580X.
+    Only claims tasks with source='api'.  Requests Gemma from the orchestrator
+    before processing (will wait if Whisper is currently loaded)."""
+
+    def __init__(self, db_path, orchestrator, running_fn):
+        self.db_path = db_path
+        self.orchestrator = orchestrator
+        self.indexer_running = running_fn
+        self.worker_id = "gemma-pro580x"
+        self.processed = 0
+        self.errors = 0
+        self._thread = None
+
+    def _get_db(self):
+        db = sqlite3.connect(str(self.db_path), timeout=30)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=30000")
+        return db
+
+    def _claim_task(self, db):
+        """Claim the next pending API visual_analysis task."""
+        now = datetime.now().isoformat()
+        with _db_write_lock:
+            row = db.execute("""
+                SELECT t.id, t.file_id
+                FROM tasks t
+                WHERE t.task_type = 'visual_analysis'
+                  AND t.status = 'pending'
+                  AND t.source = 'api'
+                ORDER BY t.created_at ASC
+                LIMIT 1
+            """).fetchone()
+            if row is None:
+                return None
+            task_id, file_id = row
+            updated = db.execute("""
+                UPDATE tasks SET status='assigned', worker_id=?, started_at=?
+                WHERE id=? AND status='pending'
+            """, (self.worker_id, now, task_id)).rowcount
+            if updated == 0:
+                return None
+            _update_api_job(db, task_id, 'assigned')
+            db.commit()
+        return task_id, file_id
+
+    def _claim_text_chat(self, db):
+        """Claim the next pending API text_chat task.
+        Returns (task_id, api_job_id) or None."""
+        now = datetime.now().isoformat()
+        with _db_write_lock:
+            row = db.execute("""
+                SELECT t.id, t.api_job_id
+                FROM tasks t
+                WHERE t.task_type = 'text_chat'
+                  AND t.status = 'pending'
+                  AND t.source = 'api'
+                ORDER BY t.created_at ASC
+                LIMIT 1
+            """).fetchone()
+            if row is None:
+                return None
+            task_id, api_job_id = row
+            updated = db.execute("""
+                UPDATE tasks SET status='assigned', worker_id=?, started_at=?
+                WHERE id=? AND status='pending'
+            """, (self.worker_id, now, task_id)).rowcount
+            if updated == 0:
+                return None
+            _update_api_job(db, task_id, 'assigned')
+            db.commit()
+        return task_id, api_job_id
+
+    def _mark(self, db, task_id, status, error=None):
+        with _db_write_lock:
+            db.execute("""
+                UPDATE tasks SET status=?, completed_at=?, error_message=?
+                WHERE id=?
+            """, (status, datetime.now().isoformat(), error, task_id))
+            db.commit()
+            _update_api_job(db, task_id, status, error=error)
+
+    def run(self):
+        db = self._get_db()
+        while self.indexer_running():
+            # Try API visual_analysis first, then text_chat
+            result = self._claim_task(db)
+            is_text_chat = False
+            if result is None:
+                result = self._claim_text_chat(db)
+                if result is None:
+                    time.sleep(2)
+                    continue
+                is_text_chat = True
+
+            # Ensure Gemma is loaded on the Pro 580X
+            gemma_url = self.orchestrator.request_gemma(timeout=120)
+            if gemma_url is None:
+                task_id = result[0]
+                log.warning("Pro580XGemmaWorker: could not get Gemma — releasing task %s" % task_id)
+                with _db_write_lock:
+                    db.execute("UPDATE tasks SET status='pending', worker_id=NULL WHERE id=?", (task_id,))
+                    db.commit()
+                time.sleep(5)
+                continue
+
+            if is_text_chat:
+                # --- text_chat processing ---
+                task_id, api_job_id = result
+                try:
+                    # Read prompt and params from api_jobs
+                    job_row = db.execute(
+                        "SELECT prompt, max_tokens, temperature FROM api_jobs WHERE id=?",
+                        (api_job_id,)
+                    ).fetchone()
+                    if not job_row or not job_row[0]:
+                        self._mark(db, task_id, "failed", "No prompt found in api_jobs")
+                        self.errors += 1
+                        continue
+                    prompt, max_tokens, temperature = job_row
+                    response = send_text_prompt(
+                        prompt, llm_server=gemma_url,
+                        max_tokens=max_tokens or 200,
+                        temperature=temperature or 0.3
+                    )
+                    if response is None:
+                        self._mark(db, task_id, "failed", "send_text_prompt returned None")
+                        self.errors += 1
+                        continue
+                    # Store result directly in api_jobs.result
+                    result_json = json.dumps({
+                        "response": response,
+                        "model": "gemma-3-12b",
+                        "max_tokens": max_tokens or 200,
+                        "temperature": temperature or 0.3,
+                    })
+                    with _db_write_lock:
+                        db.execute("UPDATE api_jobs SET result=? WHERE id=?",
+                                   (result_json, api_job_id))
+                        db.commit()
+                    self._mark(db, task_id, "complete")
+                    self.processed += 1
+                    log.info("Pro580XGemmaWorker: text_chat complete — %s" % task_id[:20])
+                except Exception as e:
+                    log.error("Pro580XGemmaWorker: text_chat error on %s: %s" % (task_id, e))
+                    self._mark(db, task_id, "failed", str(e)[:500])
+                    self.errors += 1
+                    time.sleep(2)
+            else:
+                # --- visual_analysis processing ---
+                task_id, file_id = result
+                try:
+                    suffix = "_visual_analysis"
+                    keyframe_id = task_id[:-len(suffix)]
+
+                    kf_row = db.execute(
+                        "SELECT thumbnail_path FROM keyframes WHERE id=?", (keyframe_id,)
+                    ).fetchone()
+                    file_row = db.execute(
+                        "SELECT path FROM files WHERE id=?", (file_id,)
+                    ).fetchone()
+                    file_path = file_row[0] if file_row else ""
+
+                    if kf_row is not None:
+                        # Video keyframe task
+                        thumb_path = kf_row[0]
+                        description = describe_image(thumb_path, context=file_path,
+                                                     llm_server=gemma_url)
+                        if description is None:
+                            self._mark(db, task_id, "failed", "describe_image returned None")
+                            self.errors += 1
+                            continue
+                        with _db_write_lock:
+                            db.execute("UPDATE keyframes SET ai_description=? WHERE id=?",
+                                       (description, keyframe_id))
+                            db.commit()
+                        _assemble_file_description(db, file_id, file_path)
+                        self._mark(db, task_id, "complete")
+                        self.processed += 1
+                    else:
+                        # Image file — no keyframe
+                        description = describe_image(file_path, context=file_path,
+                                                     llm_server=gemma_url)
+                        if description is None:
+                            self._mark(db, task_id, "failed", "describe_image returned None")
+                            self.errors += 1
+                            continue
+                        path_parts = [p for p in Path(file_path).parts
+                                      if p not in ("/", "mnt", "vault", "Volumes", "Vault")]
+                        tags = ", ".join(path_parts[:-1])
+                        with _db_write_lock:
+                            db.execute("UPDATE files SET ai_description=?, tags=? WHERE id=?",
+                                       (description, tags, file_id))
+                            db.commit()
+                        self._mark(db, task_id, "complete")
+                        self.processed += 1
+
+                except Exception as e:
+                    log.error("Pro580XGemmaWorker: error on %s: %s" % (task_id, e))
+                    self._mark(db, task_id, "failed", str(e)[:500])
+                    self.errors += 1
+                    time.sleep(2)
+
+        db.close()
+        log.info("Pro580XGemmaWorker: stopped (%d processed, %d errors)" % (
+            self.processed, self.errors))
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self.run, name="gemma-worker-pro580x", daemon=True)
+        self._thread.start()
+
+
+# ---------------------------------------------------------------------------
 # FaceWorker (Phase 4 — face detection)
 # ---------------------------------------------------------------------------
 
@@ -2603,7 +3512,7 @@ class FaceWorker:
                 FROM tasks t
                 WHERE t.task_type = 'face_detect'
                   AND t.status = 'pending'
-                ORDER BY t.created_at ASC
+                ORDER BY (CASE WHEN t.source = 'api' THEN 0 ELSE 1 END), t.created_at ASC
                 LIMIT 1
             """).fetchone()
             if row is None:
@@ -2615,6 +3524,7 @@ class FaceWorker:
             """, (self.worker_id, now, task_id)).rowcount
             if updated == 0:
                 return None
+            _update_api_job(db, task_id, 'assigned')
             db.commit()
         return task_id, file_id
 
@@ -2625,6 +3535,7 @@ class FaceWorker:
                 WHERE id=?
             """, (status, datetime.now().isoformat(), error, task_id))
             db.commit()
+            _update_api_job(db, task_id, status, error=error)
 
     def _process(self, db, task_id, file_id):
         keyframe_id = task_id[:-len("_face_detect")]
@@ -2689,6 +3600,176 @@ class FaceWorker:
     def start(self):
         self._thread = threading.Thread(
             target=self.run, name="face-worker", daemon=True)
+        self._thread.start()
+
+
+class ALAWorker:
+    """Alignment worker — forwards jobs to ALA server on port 8085.
+
+    API-only: the crawler never creates 'ala' tasks. Apps submit alignment
+    jobs via POST /api/jobs with task_type='ala', an audio file, and lyrics.
+    This worker claims those tasks and forwards them to the standalone ALA
+    FastAPI server (ala-server.service) running on localhost:8085.
+    """
+
+    def __init__(self, db_path, running_fn):
+        self.db_path = db_path
+        self.indexer_running = running_fn
+        self.worker_id = "ala-worker"
+        self.ala_url = "http://127.0.0.1:8085/align"
+        self.processed = 0
+        self.errors = 0
+        self._thread = None
+        self.current_task_info = None  # for worker-status
+
+    def _get_db(self):
+        db = sqlite3.connect(str(self.db_path), timeout=30)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=30000")
+        return db
+
+    def _claim_task(self, db):
+        now = datetime.now().isoformat()
+        with _db_write_lock:
+            row = db.execute("""
+                SELECT t.id, t.file_id, t.api_job_id
+                FROM tasks t
+                WHERE t.task_type = 'ala'
+                  AND t.status = 'pending'
+                ORDER BY (CASE WHEN t.source = 'api' THEN 0 ELSE 1 END), t.created_at ASC
+                LIMIT 1
+            """).fetchone()
+            if row is None:
+                return None
+            task_id, file_id, api_job_id = row
+            updated = db.execute("""
+                UPDATE tasks SET status='assigned', worker_id=?, started_at=?
+                WHERE id=? AND status='pending'
+            """, (self.worker_id, now, task_id)).rowcount
+            if updated == 0:
+                return None
+            _update_api_job(db, task_id, 'assigned')
+            db.commit()
+        return task_id, file_id, api_job_id
+
+    def _mark(self, db, task_id, status, error=None):
+        with _db_write_lock:
+            db.execute("""
+                UPDATE tasks SET status=?, completed_at=?, error_message=?
+                WHERE id=?
+            """, (status, datetime.now().isoformat(), error, task_id))
+            db.commit()
+            _update_api_job(db, task_id, status, error=error)
+
+    def _process(self, db, task_id, file_id, api_job_id):
+        # Get the upload path and lyrics
+        file_row = db.execute("SELECT path, filename FROM files WHERE id=?", (file_id,)).fetchone()
+        if not file_row:
+            self._mark(db, task_id, "failed", "File record not found")
+            return
+
+        upload_path, filename = file_row
+        self.current_task_info = {"source": "api", "file": filename, "task_type": "ala"}
+
+        # Get lyrics from api_jobs
+        lyrics = ""
+        if api_job_id:
+            lyrics_row = db.execute("SELECT lyrics FROM api_jobs WHERE id=?", (api_job_id,)).fetchone()
+            if lyrics_row and lyrics_row[0]:
+                lyrics = lyrics_row[0]
+
+        if not lyrics:
+            self._mark(db, task_id, "failed", "No lyrics provided")
+            self.current_task_info = None
+            return
+
+        if not Path(upload_path).exists():
+            self._mark(db, task_id, "failed", "Audio file not found: %s" % upload_path)
+            self.current_task_info = None
+            return
+
+        # POST to ALA server
+        try:
+            import urllib.request
+            boundary = "----ALABoundary%s" % uuid.uuid4().hex[:12]
+            body = b""
+            # Add lyrics field
+            body += b"--%s\r\n" % boundary.encode()
+            body += b"Content-Disposition: form-data; name=\"lyrics\"\r\n\r\n"
+            body += lyrics.encode("utf-8") + b"\r\n"
+            # Add audio file
+            body += b"--%s\r\n" % boundary.encode()
+            body += b"Content-Disposition: form-data; name=\"audio\"; filename=\"%s\"\r\n" % filename.encode()
+            body += b"Content-Type: application/octet-stream\r\n\r\n"
+            with open(upload_path, "rb") as f:
+                body += f.read()
+            body += b"\r\n--%s--\r\n" % boundary.encode()
+
+            req = urllib.request.Request(
+                self.ala_url,
+                data=body,
+                headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary},
+                method="POST"
+            )
+            resp = urllib.request.urlopen(req, timeout=660)  # 11 min (ALA has 10 min timeout)
+            result = json.loads(resp.read())
+
+            # Store result directly in api_jobs
+            if api_job_id:
+                with _db_write_lock:
+                    db.execute(
+                        "UPDATE api_jobs SET result=? WHERE id=?",
+                        (json.dumps(result), api_job_id)
+                    )
+                    db.commit()
+
+            self._mark(db, task_id, "complete")
+            self.processed += 1
+            log.info("ALAWorker: complete — %s (%d words)" % (filename, len(result.get("words", []))))
+
+        except Exception as e:
+            log.error("ALAWorker: error on %s: %s" % (filename, e))
+            self._mark(db, task_id, "failed", str(e)[:500])
+            self.errors += 1
+
+        self.current_task_info = None
+
+    def run(self):
+        db = self._get_db()
+        log.info("ALAWorker: started (forwarding to %s)" % self.ala_url)
+        idle_logged = False
+
+        while self.indexer_running():
+            try:
+                result = self._claim_task(db)
+                if result is None:
+                    if not idle_logged:
+                        log.info("ALAWorker: idle — waiting for ala tasks")
+                        idle_logged = True
+                    time.sleep(5)
+                    continue
+                idle_logged = False
+                task_id, file_id, api_job_id = result
+                try:
+                    self._process(db, task_id, file_id, api_job_id)
+                except Exception as e:
+                    log.error("ALAWorker: error on task %s: %s" % (task_id, e))
+                    try:
+                        self._mark(db, task_id, "failed", str(e)[:500])
+                    except Exception:
+                        pass
+                    self.errors += 1
+                    self.current_task_info = None
+            except Exception as e:
+                log.error("ALAWorker: unexpected error: %s" % e)
+                time.sleep(5)
+
+        db.close()
+        log.info("ALAWorker: stopped (%d processed, %d errors)" % (self.processed, self.errors))
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self.run, name="ala-worker", daemon=True)
         self._thread.start()
 
 
@@ -4067,14 +5148,33 @@ class MediaIndexer:
             if own_db:
                 target_db.close()
 
-    def assign_new_faces(self):
+    def assign_new_faces(self, orchestrator=None):
         """Assign unclustered faces to existing named persons by distance matching.
 
-        Faces that don't match any known person remain unclustered.
+        Borderline matches (distance 0.3–threshold) are verified by Gemma vision
+        if an orchestrator is provided. High-confidence matches (< 0.3) skip
+        verification. Faces that don't match remain unclustered.
         Returns count of newly assigned faces.
         """
         if not HAS_FACE_RECOGNITION:
             return 0
+
+        # Load per-person thresholds
+        person_thresholds = {}
+        for row in self.db.execute("SELECT id, match_threshold FROM persons WHERE match_threshold IS NOT NULL"):
+            person_thresholds[row[0]] = row[1]
+
+        # Load best reference thumbnail per person (largest bbox area)
+        person_ref_thumbs = {}
+        for row in self.db.execute("""
+            SELECT person_id, thumbnail_path,
+                   (bbox_right - bbox_left) * (bbox_bottom - bbox_top) as area
+            FROM faces
+            WHERE person_id IS NOT NULL AND thumbnail_path IS NOT NULL
+            ORDER BY area DESC
+        """).fetchall():
+            if row[0] not in person_ref_thumbs:
+                person_ref_thumbs[row[0]] = row[1]
 
         # Load all embeddings for named persons
         named = self.db.execute("""
@@ -4091,35 +5191,423 @@ class MediaIndexer:
 
         # Load unclustered/unassigned faces
         unclustered = self.db.execute(
-            "SELECT id, embedding FROM faces WHERE person_id IS NULL"
+            "SELECT id, embedding, thumbnail_path FROM faces WHERE person_id IS NULL"
         ).fetchall()
 
         if not unclustered:
             return 0
 
-        assigned = 0
-        for face_id, embedding_blob in unclustered:
+        # Phase 1: Find all candidate matches via embedding distance
+        GEMMA_VERIFY_FLOOR = 0.3  # Below this = high confidence, skip Gemma
+        candidates = []  # (face_id, person_id, min_dist, needs_gemma)
+        for face_id, embedding_blob, thumb_path in unclustered:
             encoding = load_embedding(embedding_blob)
             distances = face_recognition.face_distance(
                 known_encodings, encoding
             )
-            min_dist = float(np.min(distances))
+            best_idx = int(np.argmin(distances))
+            min_dist = float(distances[best_idx])
+            person_id = known_person_ids[best_idx]
 
-            if min_dist <= FACE_MATCH_TOLERANCE:
-                best_idx = int(np.argmin(distances))
-                person_id = known_person_ids[best_idx]
-                self.db.execute(
-                    "UPDATE faces SET person_id = ? WHERE id = ?",
-                    (person_id, face_id)
-                )
-                assigned += 1
+            threshold = person_thresholds.get(person_id, FACE_MATCH_TOLERANCE)
+
+            if min_dist <= threshold:
+                needs_gemma = min_dist > GEMMA_VERIFY_FLOOR
+                candidates.append((face_id, person_id, min_dist, needs_gemma, thumb_path))
+
+        if not candidates:
+            log.info("assign_new_faces: no candidate matches found")
+            return 0
+
+        # Phase 2: Verify borderline matches with Gemma
+        borderline = [c for c in candidates if c[3]]
+        gemma_url = None
+        verified = set()  # face_ids that passed Gemma verification
+        rejected = set()  # face_ids that failed
+
+        if borderline and orchestrator:
+            gemma_url = orchestrator.request_gemma(timeout=120)
+            if gemma_url:
+                log.info("assign_new_faces: verifying %d borderline matches with Gemma" % len(borderline))
+                for face_id, person_id, dist, _, thumb_path in borderline:
+                    ref_thumb = person_ref_thumbs.get(person_id)
+                    if ref_thumb and thumb_path:
+                        match = verify_face_match(ref_thumb, thumb_path, llm_server=gemma_url)
+                        if match:
+                            verified.add(face_id)
+                            log.info("  Gemma verified YES: face %s → %s (dist=%.3f)"
+                                     % (face_id[:8], person_id[:8], dist))
+                        else:
+                            rejected.add(face_id)
+                            log.info("  Gemma verified NO:  face %s → %s (dist=%.3f)"
+                                     % (face_id[:8], person_id[:8], dist))
+                    else:
+                        # No thumbnails — fall back to embedding-only
+                        verified.add(face_id)
+            else:
+                log.warning("assign_new_faces: could not get Gemma — skipping verification, using embedding only")
+
+        # Phase 3: Assign faces
+        assigned = 0
+        for face_id, person_id, min_dist, needs_gemma, _ in candidates:
+            if needs_gemma and face_id in rejected:
+                continue  # Gemma said no
+            if needs_gemma and gemma_url and face_id not in verified:
+                continue  # Gemma was available but didn't verify this face
+
+            self.db.execute(
+                "UPDATE faces SET person_id = ? WHERE id = ?",
+                (person_id, face_id)
+            )
+            assigned += 1
 
         if assigned:
             self.db.commit()
             self._update_face_names()
 
-        log.info("Assigned %d new faces to known persons" % assigned)
+        log.info("Assigned %d new faces to known persons (%d high-confidence, %d Gemma-verified, %d rejected)"
+                 % (assigned, len([c for c in candidates if not c[3]]),
+                    len(verified - rejected), len(rejected)))
         return assigned
+
+    def deduplicate_faces(self, db=None):
+        """Remove duplicate faces per file — keep one face per person per file.
+
+        Two passes:
+        1. Same cluster + same file: keep largest bbox (cheap, no embedding comparison)
+        2. Same file, different clusters but similar embeddings (distance < 0.4):
+           keep the largest bbox, merge the duplicate into the keeper's cluster
+
+        Returns count of faces removed.
+        """
+        if db is None:
+            db = self.db
+
+        removed = 0
+
+        # Pass 1: Same cluster + same file (fast — no embedding comparison needed)
+        dupes = db.execute("""
+            SELECT file_id, cluster_id, COUNT(*) as cnt
+            FROM faces
+            WHERE cluster_id IS NOT NULL
+            GROUP BY file_id, cluster_id
+            HAVING cnt > 1
+        """).fetchall()
+
+        for file_id, cluster_id, count in dupes:
+            faces = db.execute("""
+                SELECT id, thumbnail_path,
+                       (bbox_right - bbox_left) * (bbox_bottom - bbox_top) as area
+                FROM faces
+                WHERE file_id = ? AND cluster_id = ?
+                ORDER BY area DESC
+            """, (file_id, cluster_id)).fetchall()
+
+            for face_id, thumb_path, _ in faces[1:]:
+                db.execute("DELETE FROM faces WHERE id = ?", (face_id,))
+                if thumb_path:
+                    try:
+                        os.unlink(thumb_path)
+                    except OSError:
+                        pass
+                removed += 1
+
+        # Pass 2: Same file, different clusters but similar embeddings
+        files_with_many = db.execute("""
+            SELECT file_id, COUNT(*) as cnt
+            FROM faces
+            GROUP BY file_id
+            HAVING cnt > 1
+        """).fetchall()
+
+        for file_id, _ in files_with_many:
+            faces = db.execute("""
+                SELECT id, embedding, cluster_id,
+                       (bbox_right - bbox_left) * (bbox_bottom - bbox_top) as area
+                FROM faces
+                WHERE file_id = ?
+                ORDER BY area DESC
+            """, (file_id,)).fetchall()
+
+            if len(faces) < 2:
+                continue
+
+            # Compare each pair — mark smaller ones for deletion
+            keep_ids = set()
+            delete_ids = set()
+            for i in range(len(faces)):
+                if faces[i][0] in delete_ids:
+                    continue
+                enc_i = load_embedding(faces[i][1])
+                for j in range(i + 1, len(faces)):
+                    if faces[j][0] in delete_ids:
+                        continue
+                    enc_j = load_embedding(faces[j][1])
+                    dist = float(np.linalg.norm(enc_i - enc_j))
+                    if dist < 0.4:
+                        # Same person — delete the smaller one (j, since sorted by area desc)
+                        delete_ids.add(faces[j][0])
+
+            for face_id in delete_ids:
+                thumb = db.execute("SELECT thumbnail_path FROM faces WHERE id=?", (face_id,)).fetchone()
+                db.execute("DELETE FROM faces WHERE id = ?", (face_id,))
+                if thumb and thumb[0]:
+                    try:
+                        os.unlink(thumb[0])
+                    except OSError:
+                        pass
+                removed += 1
+
+        # Pass 3: Within-cluster dedup — remove near-identical faces across files
+        # For large clusters (e.g. 1000+ faces of the same person), many are
+        # visually identical from different video keyframes. Keep one representative
+        # face per visually-distinct appearance (distance < 0.3 = near-identical).
+        clusters_with_many = db.execute("""
+            SELECT cluster_id, COUNT(*) as cnt
+            FROM faces
+            WHERE cluster_id IS NOT NULL
+            GROUP BY cluster_id
+            HAVING cnt > 5
+        """).fetchall()
+
+        for cluster_id, count in clusters_with_many:
+            faces = db.execute("""
+                SELECT id, embedding,
+                       (bbox_right - bbox_left) * (bbox_bottom - bbox_top) as area
+                FROM faces
+                WHERE cluster_id = ?
+                ORDER BY area DESC
+            """, (cluster_id,)).fetchall()
+
+            if len(faces) < 2:
+                continue
+
+            # Greedy dedup: iterate sorted by area (best first), skip any face
+            # that's within 0.3 distance of an already-kept face
+            kept_encodings = []
+            kept_ids = set()
+            delete_ids = []
+
+            for face_id, emb_blob, area in faces:
+                enc = load_embedding(emb_blob)
+                is_dup = False
+                for kept_enc in kept_encodings:
+                    if float(np.linalg.norm(enc - kept_enc)) < 0.3:
+                        is_dup = True
+                        break
+                if is_dup:
+                    delete_ids.append(face_id)
+                else:
+                    kept_encodings.append(enc)
+                    kept_ids.add(face_id)
+
+            for face_id in delete_ids:
+                thumb = db.execute("SELECT thumbnail_path FROM faces WHERE id=?", (face_id,)).fetchone()
+                db.execute("DELETE FROM faces WHERE id = ?", (face_id,))
+                if thumb and thumb[0]:
+                    try:
+                        os.unlink(thumb[0])
+                    except OSError:
+                        pass
+                removed += 1
+
+            if delete_ids:
+                log.info("deduplicate_faces: cluster %d — kept %d, removed %d"
+                         % (cluster_id, len(kept_ids), len(delete_ids)))
+
+        if removed:
+            db.commit()
+            # Update person face counts
+            db.execute("""
+                UPDATE persons SET face_count = (
+                    SELECT COUNT(*) FROM faces WHERE person_id = persons.id
+                )
+            """)
+            db.commit()
+
+        log.info("deduplicate_faces: removed %d duplicate faces total" % removed)
+        return removed
+
+    def update_person_threshold(self, person_id, db=None):
+        """Compute and store the adaptive match threshold for a person.
+
+        Uses the 95th percentile of pairwise distances between the person's
+        confirmed faces. This threshold is used by assign_new_faces() to
+        decide if an unknown face matches this person.
+        """
+        if db is None:
+            db = self.db
+
+        rows = db.execute(
+            "SELECT embedding FROM faces WHERE person_id = ?", (person_id,)
+        ).fetchall()
+
+        if len(rows) < 2:
+            # Not enough faces to compute a meaningful threshold
+            return
+
+        embeddings = [load_embedding(r[0]) for r in rows]
+
+        # Compute pairwise distances (sample if too many faces)
+        if len(embeddings) > 200:
+            import random
+            sample = random.sample(embeddings, 200)
+        else:
+            sample = embeddings
+
+        distances = []
+        for i in range(len(sample)):
+            for j in range(i + 1, len(sample)):
+                dist = float(np.linalg.norm(sample[i] - sample[j]))
+                distances.append(dist)
+
+        if not distances:
+            return
+
+        # Use 95th percentile as the threshold — allows for variation but
+        # excludes extreme outliers (which may be mislabeled faces)
+        distances.sort()
+        idx_95 = int(len(distances) * 0.95)
+        threshold = distances[min(idx_95, len(distances) - 1)]
+
+        # Clamp to reasonable range [0.3, 0.8]
+        threshold = max(0.3, min(0.8, threshold))
+
+        db.execute(
+            "UPDATE persons SET match_threshold = ? WHERE id = ?",
+            (round(threshold, 4), person_id)
+        )
+        db.commit()
+        name = db.execute("SELECT name FROM persons WHERE id = ?", (person_id,)).fetchone()
+        log.info("Updated match threshold for %s: %.4f (from %d faces)"
+                 % (name[0] if name else person_id, threshold, len(rows)))
+
+    def audit_person_faces(self, person_id, llm_server=None):
+        """Verify all faces for a named person using Gemma vision.
+
+        Compares each face against the person's best reference thumbnail.
+        Faces that Gemma rejects are removed from the person and put back
+        in the unnamed pool. Returns count of faces rejected.
+
+        Uses short-lived DB connections to avoid locking the database during
+        the slow Gemma verification calls.
+        """
+        if llm_server is None:
+            llm_server = PRO580X_GEMMA
+
+        # Quick read — get all face data, then release DB
+        adb = sqlite3.connect(str(DB_PATH), timeout=10)
+        adb.execute("PRAGMA journal_mode=WAL")
+        adb.execute("PRAGMA busy_timeout=10000")
+
+        faces = adb.execute("""
+            SELECT id, thumbnail_path,
+                   (bbox_right - bbox_left) * (bbox_bottom - bbox_top) as area
+            FROM faces
+            WHERE person_id = ?
+            ORDER BY area DESC
+        """, (person_id,)).fetchall()
+
+        if len(faces) < 2:
+            adb.close()
+            return 0
+
+        ref_id, ref_thumb, _ = faces[0]
+        if not ref_thumb or not os.path.exists(ref_thumb):
+            adb.close()
+            log.warning("audit_person_faces: no reference thumbnail for person %s" % person_id)
+            return 0
+
+        name = adb.execute("SELECT name FROM persons WHERE id=?", (person_id,)).fetchone()
+        person_name = name[0] if name else person_id[:8]
+
+        min_row = adb.execute("SELECT MIN(cluster_id) FROM faces").fetchone()
+        next_cluster = min(min_row[0] or 0, 0) - 1
+        adb.close()  # Release DB before slow Gemma calls
+
+        log.info("Auditing %s (%d faces)..." % (person_name, len(faces)))
+
+        rejected = 0
+        for face_id, thumb_path, _ in faces[1:]:  # Skip reference face
+            if not thumb_path or not os.path.exists(thumb_path):
+                continue
+
+            # Slow Gemma call — no DB held
+            match = verify_face_match(ref_thumb, thumb_path, llm_server=llm_server)
+
+            if not match:
+                # Quick DB write — open, update, commit, close
+                wdb = sqlite3.connect(str(DB_PATH), timeout=10)
+                wdb.execute("PRAGMA busy_timeout=10000")
+                wdb.execute(
+                    "UPDATE faces SET person_id=NULL, cluster_id=? WHERE id=?",
+                    (next_cluster, face_id)
+                )
+                wdb.commit()
+                wdb.close()
+                next_cluster -= 1
+                rejected += 1
+                log.info("  Audit %s: rejected face %s" % (person_name, face_id[:8]))
+
+        if rejected:
+            # Update person face count
+            wdb = sqlite3.connect(str(self.db_path), timeout=10)
+            wdb.execute("PRAGMA busy_timeout=10000")
+            remaining = wdb.execute(
+                "SELECT COUNT(*) FROM faces WHERE person_id=?", (person_id,)
+            ).fetchone()[0]
+            wdb.execute(
+                "UPDATE persons SET face_count=? WHERE id=?", (remaining, person_id)
+            )
+            wdb.commit()
+            wdb.close()
+
+        log.info("Audit %s: %d/%d faces rejected" % (person_name, rejected, len(faces) - 1))
+        return rejected
+
+    def audit_all_persons(self, orchestrator=None):
+        """Audit all named persons using Gemma verification.
+
+        Returns dict with results per person and totals.
+        """
+        persons = self.db.execute(
+            "SELECT id, name, face_count FROM persons ORDER BY face_count DESC"
+        ).fetchall()
+
+        if not persons:
+            return {"persons_audited": 0, "faces_rejected": 0, "details": []}
+
+        # Request Gemma from orchestrator
+        gemma_url = None
+        if orchestrator:
+            gemma_url = orchestrator.request_gemma(timeout=120)
+        if not gemma_url:
+            gemma_url = PRO580X_GEMMA
+
+        total_rejected = 0
+        details = []
+        for person_id, name, face_count in persons:
+            if face_count < 2:
+                continue
+            rejected = self.audit_person_faces(person_id, llm_server=gemma_url)
+            total_rejected += rejected
+            if rejected > 0:
+                details.append({
+                    "name": name,
+                    "original_count": face_count,
+                    "rejected": rejected,
+                    "remaining": face_count - rejected,
+                })
+
+        self._update_face_names()
+        log.info("Audit complete: %d persons audited, %d faces rejected total"
+                 % (len(persons), total_rejected))
+
+        return {
+            "persons_audited": len(persons),
+            "faces_rejected": total_rejected,
+            "details": details,
+        }
 
     def name_cluster(self, cluster_id, name):
         """Assign a person name to all faces in a cluster.
@@ -4151,6 +5639,7 @@ class MediaIndexer:
 
         self.db.commit()
         self._update_face_names()
+        self.update_person_threshold(pid)
         log.info("Named cluster %d as '%s' (%d faces)" % (cluster_id, name, count))
         return pid
 
@@ -4178,6 +5667,8 @@ class MediaIndexer:
 
         self.db.commit()
         self._update_face_names()
+        if person_id:
+            self.update_person_threshold(person_id)
         log.info("Merged cluster %d into cluster %d" % (source_cluster_id, target_cluster_id))
 
     def rename_person(self, person_id, new_name):
@@ -4511,23 +6002,20 @@ def main():
         crawler = CrawlerWorker(DB_PATH, folders, interval=RESCAN_INTERVAL)
         crawler.start()
 
-        # ── Whisper worker ─────────────────────────────────────────────
-        if "transcribe" in ENABLED_TASK_TYPES:
-            whisper_ok = False
-            try:
-                req = urllib.request.Request("%s/health" % WHISPER_SERVER)
-                resp = urllib.request.urlopen(req, timeout=5)
-                whisper_ok = json.loads(resp.read()).get("status") == "ok"
-            except Exception:
-                pass
+        # ── Pro 580X Orchestrator (model-swapping GPU) ────────────────
+        orchestrator = Pro580XOrchestrator(DB_PATH)
+        orchestrator.start()  # Loads Gemma by default
 
-            if whisper_ok:
-                whisper_worker = PerpetualWhisperWorker(DB_PATH, lambda: indexer.running)
-                whisper_worker.start()
-                log.info("PerpetualWhisperWorker: online (%s)" % WHISPER_SERVER)
-            else:
-                log.warning("Whisper server not reachable — transcription disabled")
-                log.warning("Start whisper service: sudo systemctl start whisper")
+        # ── Whisper worker (uses orchestrator for model swaps) ────────
+        if "transcribe" in ENABLED_TASK_TYPES:
+            whisper_worker = PerpetualWhisperWorker(DB_PATH, lambda: indexer.running, orchestrator)
+            whisper_worker.start()
+            log.info("PerpetualWhisperWorker: online (orchestrator-managed Whisper)")
+
+        # ── Pro 580X API Gemma worker (API visual_analysis only) ──────
+        pro580x_gemma = Pro580XGemmaWorker(DB_PATH, orchestrator, lambda: indexer.running)
+        pro580x_gemma.start()
+        log.info("Pro580XGemmaWorker: online (API visual_analysis on Pro 580X)")
 
         # ── Scene workers (Phase 2) ─────────────────────────────────────
         if "scene_detect" in ENABLED_TASK_TYPES:
@@ -4562,6 +6050,11 @@ def main():
                 log.warning("face_recognition not installed — face detection disabled")
                 log.warning("Install with: pip3 install face_recognition")
 
+        # ── ALA worker (alignment — API-only, no crawler tasks) ────────
+        ala_worker = ALAWorker(DB_PATH, lambda: indexer.running)
+        ala_worker.start()
+        log.info("ALAWorker: online (forwarding to localhost:8085)")
+
         # ── Task Coordinator ───────────────────────────────────────────
         coordinator = TaskCoordinator(DB_PATH, lambda: indexer.running)
         coordinator.start()
@@ -4573,6 +6066,7 @@ def main():
             write_scanner_state(indexer.scanner)
             time.sleep(10)
 
+        orchestrator.shutdown()
         log.info("Perpetual Task Pipeline stopped.")
 
     elif command == "transcribe":
@@ -4967,6 +6461,7 @@ loadAll();
 
         # Shared progress tracker for background face detection
         detect_progress = {"running": False, "processed": 0, "total": 0, "faces_found": 0, "current_file": ""}
+        audit_progress = {"running": False, "processed": 0, "total": 0, "rejected": 0, "current_person": "", "details": []}
 
         class SearchHandler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -5020,7 +6515,6 @@ loadAll();
                     _GPU_SERVERS = [
                         {"id": 0, "port": 8090, "name": "Gemma0"},
                         {"id": 1, "port": 8091, "name": "Gemma1"},
-                        {"id": 2, "port": 8092, "name": "Whisper"},
                     ]
 
                     def _check_gpu(srv):
@@ -5053,9 +6547,45 @@ loadAll();
                         except Exception:
                             return dict(srv, online=False, processing=False)
 
-                    with ThreadPoolExecutor(max_workers=3) as pool:
+                    with ThreadPoolExecutor(max_workers=2) as pool:
                         results = list(pool.map(_check_gpu, _GPU_SERVERS))
+
+                    # Add Pro 580X status from orchestrator state file
+                    pro580x_entry = {"id": 2, "port": 0, "name": "Pro 580X",
+                                     "online": False, "processing": False,
+                                     "current_model": None, "state": "unknown"}
+                    try:
+                        with open(str(PRO580X_STATE_FILE)) as f:
+                            orch_state = json.loads(f.read())
+                        state = orch_state.get("state", "unknown")
+                        model = orch_state.get("current_model")
+                        pro580x_entry["state"] = state
+                        pro580x_entry["current_model"] = model
+                        if model == "gemma":
+                            pro580x_entry["port"] = PRO580X_GEMMA_PORT
+                            pro580x_entry["online"] = state == "gemma_ready"
+                            pro580x_entry["processing"] = orch_state.get("api_pending", False)
+                        elif model == "whisper":
+                            pro580x_entry["port"] = PRO580X_WHISPER_PORT
+                            pro580x_entry["online"] = state == "whisper_busy"
+                            pro580x_entry["processing"] = True
+                        else:
+                            pro580x_entry["online"] = state in ("gemma_loading", "whisper_loading")
+                    except Exception:
+                        pass
+                    results.append(pro580x_entry)
                     self._json({"servers": results})
+
+                elif parsed.path == "/orchestrator-status":
+                    # Pro 580X orchestrator status — read from state file (IPC)
+                    try:
+                        with open(str(PRO580X_STATE_FILE)) as f:
+                            state = json.loads(f.read())
+                        self._json(state)
+                    except FileNotFoundError:
+                        self._json({"state": "unknown", "error": "Orchestrator not started (no state file)"})
+                    except Exception as e:
+                        self._json({"state": "unknown", "error": str(e)})
 
                 elif parsed.path == "/thumbnail":
                     fid = params.get("id", [""])[0]
@@ -5118,8 +6648,44 @@ loadAll();
                 elif parsed.path == "/faces/detect/progress":
                     self._json(detect_progress)
 
+                elif parsed.path == "/faces/audit/progress":
+                    self._json(audit_progress)
+
                 elif parsed.path == "/faces/status":
                     self._json(indexer.get_face_status())
+
+                elif parsed.path.startswith("/faces/cluster/") and parsed.path.endswith("/faces"):
+                    # GET /faces/cluster/<id>/faces — all faces in a cluster
+                    parts = parsed.path.split("/")
+                    try:
+                        cluster_id = int(parts[3])
+                    except (IndexError, ValueError):
+                        self._json({"error": "Invalid cluster ID"}, 400)
+                        return
+                    fdb = sqlite3.connect(str(DB_PATH), timeout=10)
+                    fdb.execute("PRAGMA journal_mode=WAL")
+                    rows = fdb.execute("""
+                        SELECT f.id, f.thumbnail_path, p.name
+                        FROM faces f
+                        LEFT JOIN persons p ON f.person_id = p.id
+                        WHERE f.cluster_id = ?
+                        ORDER BY f.created_at ASC
+                    """, (cluster_id,)).fetchall()
+                    person_name = rows[0][2] if rows and rows[0][2] else None
+                    faces = []
+                    for fid, thumb, _ in rows:
+                        faces.append({
+                            "id": fid,
+                            "thumbnail_url": "/faces/thumbnail?id=%s" % fid,
+                            "has_thumbnail": bool(thumb and os.path.exists(thumb)),
+                        })
+                    fdb.close()
+                    self._json({
+                        "cluster_id": cluster_id,
+                        "person_name": person_name,
+                        "face_count": len(faces),
+                        "faces": faces,
+                    })
 
                 elif parsed.path == "/faces/thumbnail":
                     fid = params.get("id", [""])[0]
@@ -5253,12 +6819,145 @@ loadAll();
                         "segments": segments,
                     })
 
+                # --- API Job endpoints ---
+                elif parsed.path.startswith("/api/jobs/"):
+                    # GET /api/jobs/<job_id> — single job status
+                    job_id = parsed.path[len("/api/jobs/"):]
+                    adb = sqlite3.connect(str(DB_PATH), timeout=10)
+                    adb.execute("PRAGMA journal_mode=WAL")
+                    row = adb.execute("""
+                        SELECT id, task_type, status, source_app, uploaded_filename,
+                               result, error_message, created_at, started_at, completed_at
+                        FROM api_jobs WHERE id=?
+                    """, (job_id,)).fetchone()
+                    if not row:
+                        adb.close()
+                        self._json({"error": "Job not found"}, 404)
+                    else:
+                        queue_position = None
+                        if row[2] == 'queued':
+                            queue_position = adb.execute("""
+                                SELECT COUNT(*) FROM tasks
+                                WHERE source = 'api' AND task_type = ? AND status = 'pending'
+                                  AND created_at < ?
+                            """, (row[1], row[7])).fetchone()[0]
+                        result_data = None
+                        if row[5]:
+                            try:
+                                result_data = json.loads(row[5])
+                            except (json.JSONDecodeError, TypeError):
+                                result_data = row[5]
+                        adb.close()
+                        self._json({
+                            "job_id": row[0],
+                            "task_type": row[1],
+                            "status": row[2],
+                            "source_app": row[3],
+                            "uploaded_filename": row[4],
+                            "result": result_data,
+                            "error_message": row[6],
+                            "created_at": row[7],
+                            "started_at": row[8],
+                            "completed_at": row[9],
+                            "queue_position": queue_position,
+                        })
+
+                elif parsed.path == "/api/jobs":
+                    # GET /api/jobs — list jobs
+                    status_filter = params.get("status", [None])[0]
+                    type_filter = params.get("task_type", [None])[0]
+                    app_filter = params.get("source_app", [None])[0]
+                    try:
+                        limit = int(params.get("limit", ["20"])[0])
+                    except ValueError:
+                        limit = 20
+                    limit = max(1, min(limit, 100))
+
+                    conditions = []
+                    bind_vals = []
+                    if status_filter:
+                        conditions.append("status = ?")
+                        bind_vals.append(status_filter)
+                    if type_filter:
+                        conditions.append("task_type = ?")
+                        bind_vals.append(type_filter)
+                    if app_filter:
+                        conditions.append("source_app = ?")
+                        bind_vals.append(app_filter)
+
+                    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+                    bind_vals.append(limit)
+
+                    adb = sqlite3.connect(str(DB_PATH), timeout=10)
+                    adb.execute("PRAGMA journal_mode=WAL")
+                    rows = adb.execute(
+                        "SELECT id, task_type, status, source_app, uploaded_filename, "
+                        "created_at, started_at, completed_at "
+                        "FROM api_jobs%s ORDER BY created_at DESC LIMIT ?" % where,
+                        bind_vals
+                    ).fetchall()
+                    adb.close()
+                    jobs = [{
+                        "job_id": r[0], "task_type": r[1], "status": r[2],
+                        "source_app": r[3], "uploaded_filename": r[4],
+                        "created_at": r[5], "started_at": r[6], "completed_at": r[7],
+                    } for r in rows]
+                    self._json({"jobs": jobs, "count": len(jobs)})
+
+                elif parsed.path == "/api/queue":
+                    # GET /api/queue — queue overview
+                    adb = sqlite3.connect(str(DB_PATH), timeout=10)
+                    adb.execute("PRAGMA journal_mode=WAL")
+
+                    # API job status counts
+                    api_counts = {}
+                    for row in adb.execute(
+                        "SELECT status, COUNT(*) FROM api_jobs GROUP BY status"
+                    ).fetchall():
+                        api_counts[row[0]] = row[1]
+
+                    # Per-type breakdown: API vs crawler pending/processing
+                    by_type = {}
+                    for row in adb.execute("""
+                        SELECT task_type, source,
+                               SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),
+                               SUM(CASE WHEN status='assigned' THEN 1 ELSE 0 END)
+                        FROM tasks
+                        WHERE status IN ('pending', 'assigned')
+                        GROUP BY task_type, source
+                    """).fetchall():
+                        tt = row[0]
+                        if tt not in by_type:
+                            by_type[tt] = {"api_queued": 0, "api_processing": 0,
+                                           "crawler_pending": 0, "crawler_processing": 0}
+                        if row[1] == 'api':
+                            by_type[tt]["api_queued"] = row[2]
+                            by_type[tt]["api_processing"] = row[3]
+                        else:
+                            by_type[tt]["crawler_pending"] = row[2]
+                            by_type[tt]["crawler_processing"] = row[3]
+                    adb.close()
+
+                    self._json({
+                        "api_jobs": api_counts,
+                        "by_type": by_type,
+                    })
+
+                elif parsed.path == "/worker-status":
+                    self._handle_worker_status()
+
                 else:
                     self._json({"error": "Not found"}, 404)
 
             def do_POST(self):
                 parsed = urlparse.urlparse(self.path)
                 length = int(self.headers.get("Content-Length", 0))
+
+                # --- /api/jobs: multipart file upload ---
+                if parsed.path == "/api/jobs":
+                    self._handle_api_job_submit(length)
+                    return
+
                 body = self.rfile.read(length) if length else b"{}"
                 try:
                     data = json.loads(body)
@@ -5317,6 +7016,44 @@ loadAll();
                     indexer.unname_cluster(int(cluster_id))
                     self._json({"ok": True})
 
+                elif parsed.path == "/faces/remove-face":
+                    face_id = data.get("face_id", "").strip()
+                    if not face_id:
+                        self._json({"error": "face_id required"}, 400)
+                        return
+                    fdb = sqlite3.connect(str(DB_PATH), timeout=10)
+                    fdb.execute("PRAGMA journal_mode=WAL")
+                    fdb.execute("PRAGMA busy_timeout=10000")
+                    # Get current cluster info before removing
+                    row = fdb.execute(
+                        "SELECT cluster_id, person_id FROM faces WHERE id=?", (face_id,)
+                    ).fetchone()
+                    if not row:
+                        fdb.close()
+                        self._json({"error": "Face not found"}, 404)
+                        return
+                    old_cluster_id, old_person_id = row
+                    # Find next available negative cluster_id for unclustered faces
+                    min_row = fdb.execute("SELECT MIN(cluster_id) FROM faces").fetchone()
+                    new_cluster = min(min_row[0] or 0, 0) - 1
+                    # Move face to its own unclustered cluster
+                    fdb.execute(
+                        "UPDATE faces SET person_id=NULL, cluster_id=? WHERE id=?",
+                        (new_cluster, face_id)
+                    )
+                    # If old cluster is now empty of that person, clean up person record face count
+                    if old_person_id:
+                        remaining = fdb.execute(
+                            "SELECT COUNT(*) FROM faces WHERE person_id=?", (old_person_id,)
+                        ).fetchone()[0]
+                        fdb.execute(
+                            "UPDATE persons SET face_count=? WHERE id=?",
+                            (remaining, old_person_id)
+                        )
+                    fdb.commit()
+                    fdb.close()
+                    self._json({"ok": True, "new_cluster_id": new_cluster})
+
                 elif parsed.path == "/faces/ignore":
                     cluster_id = data.get("cluster_id")
                     if cluster_id is None:
@@ -5341,6 +7078,55 @@ loadAll();
                     ndb.commit()
                     ndb.close()
                     self._json({"ok": True, "marked_read": updated})
+
+                elif parsed.path == "/faces/deduplicate":
+                    removed = indexer.deduplicate_faces()
+                    self._json({"ok": True, "removed": removed})
+
+                elif parsed.path == "/faces/audit":
+                    if audit_progress["running"]:
+                        self._json({"ok": True, "message": "Audit already running", **audit_progress})
+                        return
+                    person_id = data.get("person_id")
+
+                    def _run_audit():
+                        try:
+                            audit_progress["running"] = True
+                            audit_progress["processed"] = 0
+                            audit_progress["rejected"] = 0
+                            audit_progress["details"] = []
+
+                            adb = sqlite3.connect(str(DB_PATH), timeout=10)
+                            adb.execute("PRAGMA journal_mode=WAL")
+                            if person_id:
+                                persons = adb.execute(
+                                    "SELECT id, name, face_count FROM persons WHERE id=?",
+                                    (person_id,)).fetchall()
+                            else:
+                                persons = adb.execute(
+                                    "SELECT id, name, face_count FROM persons WHERE face_count > 1 ORDER BY face_count DESC"
+                                ).fetchall()
+                            adb.close()
+
+                            audit_progress["total"] = len(persons)
+                            for pid, pname, fcount in persons:
+                                audit_progress["current_person"] = pname
+                                rejected = indexer.audit_person_faces(pid)
+                                audit_progress["processed"] += 1
+                                audit_progress["rejected"] += rejected
+                                if rejected > 0:
+                                    audit_progress["details"].append({
+                                        "name": pname, "rejected": rejected,
+                                        "original": fcount, "remaining": fcount - rejected
+                                    })
+                        except Exception as e:
+                            log.error("Audit error: %s" % e)
+                        finally:
+                            audit_progress["running"] = False
+                            audit_progress["current_person"] = ""
+
+                    threading.Thread(target=_run_audit, daemon=True, name="face-audit").start()
+                    self._json({"ok": True, "message": "Audit started in background", "persons": audit_progress["total"]})
 
                 elif parsed.path == "/faces/detect":
                     if not HAS_FACE_RECOGNITION:
@@ -5444,10 +7230,415 @@ loadAll();
                 else:
                     self._json({"error": "Not found"}, 404)
 
+            def _handle_worker_status(self):
+                """GET /worker-status — detailed worker and queue info for VaultSearch."""
+                _GPU_SERVERS = [
+                    {"name": "Gemma0", "port": 8090, "model": "Gemma 3 12B", "task_type": "visual_analysis"},
+                    {"name": "Gemma1", "port": 8091, "model": "Gemma 3 12B", "task_type": "visual_analysis"},
+                ]
+
+                # Check GPU online/processing status
+                def _check(srv):
+                    port = srv["port"]
+                    base = "http://localhost:%d" % port
+                    try:
+                        req = urllib.request.Request("%s/health" % base)
+                        resp = urllib.request.urlopen(req, timeout=5)
+                        code = resp.getcode()
+                        if code == 503:
+                            return True, True  # online, processing
+                        if code != 200:
+                            return False, False
+                        try:
+                            sreq = urllib.request.Request("%s/slots" % base)
+                            sresp = urllib.request.urlopen(sreq, timeout=3)
+                            slots = json.loads(sresp.read())
+                            processing = any(s.get("is_processing", False) for s in slots)
+                            return True, processing
+                        except Exception:
+                            return True, False
+                    except urllib.error.URLError as e:
+                        if "timed out" in str(e).lower():
+                            return True, True  # blocked = busy
+                        return False, False
+                    except Exception:
+                        return False, False
+
+                adb = sqlite3.connect(str(DB_PATH), timeout=10)
+                adb.execute("PRAGMA journal_mode=WAL")
+
+                # Get currently assigned tasks
+                assigned = adb.execute("""
+                    SELECT t.id, t.task_type, t.worker_id, t.source, f.filename
+                    FROM tasks t JOIN files f ON t.file_id = f.id
+                    WHERE t.status = 'assigned'
+                """).fetchall()
+
+                # Build worker_id -> task info map
+                assigned_map = {}
+                for tid, ttype, wid, src, fname in assigned:
+                    if wid:
+                        assigned_map[wid] = {"source": src or "crawler", "file": fname, "task_type": ttype}
+
+                # Queue depths by type and source
+                queue_rows = adb.execute("""
+                    SELECT task_type, source, COUNT(*) FROM tasks
+                    WHERE status = 'pending'
+                    GROUP BY task_type, source
+                """).fetchall()
+                queue_map = {}  # {task_type: {api: N, crawler: M}}
+                for tt, src, cnt in queue_rows:
+                    if tt not in queue_map:
+                        queue_map[tt] = {"api": 0, "crawler": 0}
+                    queue_map[tt][src or "crawler"] = cnt
+
+                # Read scanner state for crawler info
+                scanner_state = {"state": "idle", "current_folder": ""}
+                try:
+                    if SCANNER_STATE_FILE.exists():
+                        with open(SCANNER_STATE_FILE, "r") as f:
+                            sdata = json.load(f)
+                        ss = sdata.get("state", {})
+                        scanner_state["state"] = ss.get("state", "idle")
+                        scanner_state["current_folder"] = Path(ss.get("current_folder", "")).name if ss.get("current_folder") else ""
+                except Exception:
+                    pass
+
+                adb.close()
+
+                # Build GPU list
+                gpus = []
+                for srv in _GPU_SERVERS:
+                    online, processing = _check(srv)
+                    # Find current task for this GPU by matching worker_id pattern
+                    current_task = None
+                    port_str = str(srv["port"])
+                    for wid, tinfo in assigned_map.items():
+                        if port_str in wid:
+                            current_task = tinfo
+                            break
+                    q = queue_map.get(srv["task_type"], {"api": 0, "crawler": 0})
+                    gpus.append({
+                        "name": srv["name"],
+                        "port": srv["port"],
+                        "model": srv["model"],
+                        "online": online,
+                        "processing": processing or (current_task is not None),
+                        "current_task": current_task,
+                        "queue": q,
+                    })
+
+                # Pro 580X — dynamic model (Gemma for API or Whisper for transcription)
+                pro580x_current = None
+                for wid, tinfo in assigned_map.items():
+                    if "pro580x" in wid or ("whisper" in wid):
+                        pro580x_current = tinfo
+                        break
+                try:
+                    with open(str(PRO580X_STATE_FILE)) as f:
+                        orch = json.loads(f.read())
+                    orch_state = orch.get("state", "unknown")
+                    orch_model = orch.get("current_model")
+                    if orch_model == "gemma":
+                        model_name = "Gemma 3 12B (API)"
+                        port = PRO580X_GEMMA_PORT
+                    elif orch_model == "whisper":
+                        model_name = "Whisper large-v3-turbo"
+                        port = PRO580X_WHISPER_PORT
+                    else:
+                        model_name = "loading..."
+                        port = 0
+                    va_q = queue_map.get("visual_analysis", {"api": 0, "crawler": 0})
+                    tr_q = queue_map.get("transcribe", {"api": 0, "crawler": 0})
+                    gpus.append({
+                        "name": "Pro 580X",
+                        "port": port,
+                        "model": model_name,
+                        "online": orch_state in ("gemma_ready", "whisper_busy"),
+                        "processing": pro580x_current is not None or orch_state == "whisper_busy",
+                        "current_task": pro580x_current,
+                        "queue": {"api": va_q.get("api", 0), "crawler": tr_q.get("crawler", 0)},
+                        "orchestrator_state": orch_state,
+                    })
+                except Exception:
+                    gpus.append({
+                        "name": "Pro 580X",
+                        "port": 0,
+                        "model": "unknown",
+                        "online": False,
+                        "processing": False,
+                        "current_task": None,
+                        "queue": {"api": 0, "crawler": 0},
+                        "orchestrator_state": "unknown",
+                    })
+
+                # CPU workers
+                fd_q = queue_map.get("face_detect", {"api": 0, "crawler": 0})
+                face_current = None
+                for wid, tinfo in assigned_map.items():
+                    if "face" in wid:
+                        face_current = tinfo
+                        break
+
+                sd_q = queue_map.get("scene_detect", {"api": 0, "crawler": 0})
+                scene_active = sum(1 for wid in assigned_map if "scene" in wid)
+
+                # ALA worker
+                ala_q = queue_map.get("ala", {"api": 0, "crawler": 0})
+                ala_current = None
+                for wid, tinfo in assigned_map.items():
+                    if "ala" in wid:
+                        ala_current = tinfo
+                        break
+
+                self._json({
+                    "gpus": gpus,
+                    "cpu_workers": {
+                        "face_detect": {
+                            "processing": face_current is not None,
+                            "current_task": face_current,
+                            "queue": fd_q,
+                        },
+                        "scene_detect": {
+                            "workers": 3,
+                            "active": scene_active,
+                            "queue": sd_q,
+                        },
+                        "ala": {
+                            "processing": ala_current is not None,
+                            "current_task": ala_current,
+                            "queue": ala_q,
+                        },
+                    },
+                    "crawler": scanner_state,
+                })
+
+            def _handle_api_job_submit(self, length):
+                """Handle POST /api/jobs — multipart file upload for job submission."""
+                VALID_TASK_TYPES = {'transcribe', 'visual_analysis', 'face_detect', 'scene_detect', 'ala', 'text_chat'}
+                content_type = self.headers.get("Content-Type", "")
+                ctype, pdict = cgi.parse_header(content_type)
+                if ctype != "multipart/form-data":
+                    self._json({"error": "Content-Type must be multipart/form-data"}, 400)
+                    return
+
+                # Read the raw body and parse multipart using email module
+                # to correctly extract filenames from Content-Disposition
+                raw_body = self.rfile.read(length)
+                boundary = pdict.get('boundary', '')
+                if isinstance(boundary, str):
+                    boundary = boundary.encode()
+
+                # Parse using email to get filenames
+                from email.parser import BytesParser
+                from email.policy import default as email_policy
+                msg_bytes = (
+                    b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + raw_body
+                )
+                msg = BytesParser(policy=email_policy).parsebytes(msg_bytes)
+
+                fields = {}  # name -> value
+                file_data = None
+                original_filename = "upload"
+
+                for part in msg.iter_parts():
+                    cd = part.get("Content-Disposition", "")
+                    _, cd_params = cgi.parse_header(cd)
+                    name = cd_params.get("name", "")
+                    fname = cd_params.get("filename")
+                    payload = part.get_payload(decode=True)
+                    if fname:
+                        # This is the file part
+                        file_data = payload
+                        original_filename = Path(fname).name or "upload"
+                    else:
+                        val = payload.decode("utf-8", errors="replace") if payload else ""
+                        fields[name] = val.strip()
+
+                # Extract task_type
+                task_type = fields.get("task_type", "").strip()
+                if task_type not in VALID_TASK_TYPES:
+                    self._json({"error": "task_type must be one of: %s" % ", ".join(sorted(VALID_TASK_TYPES))}, 400)
+                    return
+
+                # --- text_chat: prompt-only, no file required ---
+                if task_type == 'text_chat':
+                    prompt = fields.get("prompt", "").strip()
+                    if not prompt:
+                        self._json({"error": "prompt is required for text_chat"}, 400)
+                        return
+                    source_app = fields.get("source_app", "").strip() or None
+                    max_tokens = None
+                    temperature = None
+                    try:
+                        max_tokens = int(fields["max_tokens"]) if "max_tokens" in fields else None
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        temperature = float(fields["temperature"]) if "temperature" in fields else None
+                    except (ValueError, TypeError):
+                        pass
+
+                    job_id = str(uuid.uuid4())
+                    now = datetime.now().isoformat()
+                    # Synthetic file_id — no real file
+                    fid = hashlib.sha256(("%s|%s" % (prompt[:200], now)).encode()).hexdigest()[:16]
+                    task_id = "%s_text_chat" % fid
+
+                    adb = sqlite3.connect(str(DB_PATH), timeout=30)
+                    adb.execute("PRAGMA journal_mode=WAL")
+                    adb.execute("PRAGMA busy_timeout=30000")
+                    try:
+                        adb.execute("""
+                            INSERT INTO api_jobs (id, task_type, status, source_app, prompt, max_tokens, temperature, created_at)
+                            VALUES (?, 'text_chat', 'queued', ?, ?, ?, ?, ?)
+                        """, (job_id, source_app, prompt, max_tokens, temperature, now))
+                        adb.execute("""
+                            INSERT INTO tasks (id, file_id, task_type, status, source, api_job_id, created_at)
+                            VALUES (?, ?, 'text_chat', 'pending', 'api', ?, ?)
+                        """, (task_id, fid, job_id, now))
+                        adb.commit()
+                        pos = adb.execute("""
+                            SELECT COUNT(*) FROM tasks
+                            WHERE source = 'api' AND task_type = 'text_chat' AND status = 'pending'
+                              AND created_at < ?
+                        """, (now,)).fetchone()[0]
+                        self._json({
+                            "ok": True,
+                            "job_id": job_id,
+                            "task_id": task_id,
+                            "task_type": "text_chat",
+                            "status": "queued",
+                            "queue_position": pos
+                        })
+                    except Exception as e:
+                        adb.rollback()
+                        self._json({"error": "Failed to create job: %s" % e}, 500)
+                    finally:
+                        adb.close()
+                    return
+
+                # --- File-based tasks: require file upload ---
+                if not file_data:
+                    self._json({"error": "file is required"}, 400)
+                    return
+
+                source_app = fields.get("source_app", "").strip() or None
+
+                # Generate job ID and save file
+                job_id = str(uuid.uuid4())
+                safe_name = re.sub(r'[^\w.\-]', '_', original_filename)
+                upload_path = str(UPLOAD_DIR / ("%s_%s" % (job_id, safe_name)))
+                with open(upload_path, "wb") as f:
+                    f.write(file_data)
+
+                now = datetime.now().isoformat()
+                fsize = len(file_data)
+
+                # Create a virtual file record
+                fid = hashlib.sha256(("%s|%s|%s" % (upload_path, fsize, now)).encode()).hexdigest()[:16]
+                # Determine file type from extension
+                ext = Path(original_filename).suffix.lower()
+                if ext in IMAGE_EXTS:
+                    file_type = "image"
+                elif ext in VIDEO_EXTS:
+                    file_type = "video"
+                elif ext in AUDIO_EXTS:
+                    file_type = "audio"
+                else:
+                    file_type = "unknown"
+
+                adb = sqlite3.connect(str(DB_PATH), timeout=30)
+                adb.execute("PRAGMA journal_mode=WAL")
+                adb.execute("PRAGMA busy_timeout=30000")
+                try:
+                    # Insert file record (so workers can find it via JOIN)
+                    adb.execute("""
+                        INSERT OR IGNORE INTO files (id, path, filename, file_type, size_bytes, modified_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                    """, (fid, upload_path, original_filename, file_type, fsize, now))
+
+                    # Insert API job record
+                    lyrics = fields.get("lyrics", "").strip() or None
+                    adb.execute("""
+                        INSERT INTO api_jobs (id, task_type, status, source_app, uploaded_filename, upload_path, lyrics, created_at)
+                        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
+                    """, (job_id, task_type, source_app, original_filename, upload_path, lyrics, now))
+
+                    # Create the task
+                    task_id = "%s_%s" % (fid, task_type)
+                    adb.execute("""
+                        INSERT INTO tasks (id, file_id, task_type, status, source, api_job_id, created_at)
+                        VALUES (?, ?, ?, 'pending', 'api', ?, ?)
+                    """, (task_id, fid, task_type, job_id, now))
+                    adb.commit()
+
+                    # Calculate queue position
+                    pos = adb.execute("""
+                        SELECT COUNT(*) FROM tasks
+                        WHERE source = 'api' AND task_type = ? AND status = 'pending'
+                          AND created_at < ?
+                    """, (task_type, now)).fetchone()[0]
+
+                    self._json({
+                        "ok": True,
+                        "job_id": job_id,
+                        "task_id": task_id,
+                        "task_type": task_type,
+                        "status": "queued",
+                        "queue_position": pos
+                    })
+                except Exception as e:
+                    adb.rollback()
+                    # Clean up uploaded file on error
+                    try:
+                        os.unlink(upload_path)
+                    except OSError:
+                        pass
+                    self._json({"error": "Failed to create job: %s" % e}, 500)
+                finally:
+                    adb.close()
+
+            def do_DELETE(self):
+                parsed = urlparse.urlparse(self.path)
+                # DELETE /api/jobs/<job_id>
+                if parsed.path.startswith("/api/jobs/"):
+                    job_id = parsed.path[len("/api/jobs/"):]
+                    if not job_id:
+                        self._json({"error": "job_id required"}, 400)
+                        return
+                    adb = sqlite3.connect(str(DB_PATH), timeout=30)
+                    adb.execute("PRAGMA journal_mode=WAL")
+                    adb.execute("PRAGMA busy_timeout=30000")
+                    try:
+                        row = adb.execute(
+                            "SELECT status, upload_path FROM api_jobs WHERE id=?", (job_id,)
+                        ).fetchone()
+                        if not row:
+                            self._json({"error": "Job not found"}, 404)
+                            return
+                        if row[0] != 'queued':
+                            self._json({"error": "Can only cancel queued jobs (current status: %s)" % row[0]}, 409)
+                            return
+                        # Delete task, job, and uploaded file
+                        adb.execute("DELETE FROM tasks WHERE api_job_id=?", (job_id,))
+                        adb.execute("DELETE FROM api_jobs WHERE id=?", (job_id,))
+                        adb.commit()
+                        if row[1]:
+                            try:
+                                os.unlink(row[1])
+                            except OSError:
+                                pass
+                        self._json({"ok": True, "cancelled": job_id})
+                    finally:
+                        adb.close()
+                else:
+                    self._json({"error": "Not found"}, 404)
+
             def do_OPTIONS(self):
                 self.send_response(204)
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -5560,6 +7751,11 @@ loadAll();
                             log.info("Auto-clustering new faces...")
                             clusters = indexer.cluster_faces(db=thread_db)
                             log.info("Auto-clustering complete: %d new clusters" % len(clusters))
+
+                            # Deduplicate: keep best face per person per file
+                            deduped = indexer.deduplicate_faces(db=thread_db)
+                            if deduped:
+                                log.info("Dedup: removed %d duplicate faces" % deduped)
 
                         thread_db.close()
                     except Exception as e:
